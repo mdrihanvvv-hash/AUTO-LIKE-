@@ -1,2382 +1,266 @@
-import json
-import os
-import requests
-import signal
-import sys
-import secrets
-import string
+from flask import Flask, request, jsonify
 import asyncio
-import time
-import html
-import binascii
-import random
-import datetime
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, List
-import pytz
-import re
-
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-
-# ===== Protobuf & Crypto Imports =====
-import aiohttp
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
-from google.protobuf.json_format import MessageToJson
+import binascii
+import aiohttp
+import requests
+import json
 import like_pb2
-import like_count_pb2
 import uid_generator_pb2
-import my_pb2
-import output_pb2
+import visit_count_pb2
+from google.protobuf.message import DecodeError
+from collections import OrderedDict
 
-# ===== CONFIG =====
-BOT_TOKEN = '8947487821:AAG5cJgwxabY5uofzaAWAwPVzd1Ow14bfww'
-LIKE_API_KEY = 'Anurag'  # eta must
-BASE_URL = 'https://autolikebot.vercel.app/like'  # eta must
-VERIFIED_FILE = 'verified_users.json'
-SHORT_LINK_FILE = 'verified_links.json'
-USAGE_FILE = 'daily_usage.json'
-VIP_FILE = 'vip_users.json'
-TOKEN_FILE = 'verification_tokens.json'
-SETTINGS_FILE = 'settings.json'
-CHANNELS_FILE = 'channels.json'
-AUTOLIKE_SCHEDULES_FILE = 'autolike_schedules.json'
-AUTOLIKE_LOGS_FILE = 'autolike_logs.json'
-ALLOWED_GROUPS_FILE = 'allowed_groups.json'
-BOT_STATE_FILE = 'bot_state.json'  # new
+app = Flask(__name__)
 
-# ===== MULTIPLE OWNERS =====
-OWNER_IDS = [8810967933, 8543489661]
-ADMIN_ID = OWNER_IDS[0]
+# ✅ Valid API keys
+VALID_API_KEYS = {
+    "Anurag"  # don't change warna api or bot dono nhi chalega 
+}
 
-MAX_LIKES = 99999
-OFFICIAL_GROUP_USERNAME = "@ff_like_group_10"
-OFFICIAL_GROUP_LINK = "https://t.me/ff_like_group_10"
-CHANNEL_LINK = "https://t.me/Rn_Official"
-CHANNEL_USERNAME = "@Rn_Official"
-VALID_REGIONS = ['ind', 'bd', 'sg', 'id', 'me', 'br', 'vn', 'eu', 'th', 'na', 'us', 'uk']
-JOIN_CHANNEL_LINK = "https://t.me/ff_like_group_10"
-HOW_TO_VERIFY_LINK = "https://t.me/Mohamed_Rihan1"
-BUY_VIP_LINK = "https://t.me/Mohamed_Rihan1"
+# 🔢 Like limit tracking
+daily_limit = 20
+used_count = 0
 
-FREE_DAILY_LIMIT = 1
-VIP_DAILY_LIMIT = 10
 
-bot_app = None
-
-# ===== TOKEN CACHE & ACCOUNT LOAD =====
-AES_KEY = b'Yg&tc%DEuh6%Zc^8'
-AES_IV = b'6oyZDr22E3ychjM%'
-TOKEN_CACHE_FILE = "token_bd.json"
-TOKEN_CACHE_IND_FILE = "token_ind.json"
-CACHE_DURATION = 25200
-TOKEN_REFRESH_INTERVAL = 7 * 3600
-token_cache: Dict[str, Dict] = {}
-token_cache_ind: Dict[str, Dict] = {}
-token_refresh_lock = asyncio.Lock()
-
-# ===== TIMEZONE =====
-BD_TZ = pytz.timezone('Asia/Dhaka')
-
-# ===== FILE HELPERS =====
-def load_json(path):
-    if not os.path.exists(path):
-        return [] if not path.endswith('schedules.json') and not path.endswith('groups.json') else {}
+def load_tokens(region):
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-            if not content:
-                return [] if not path.endswith('schedules.json') and not path.endswith('groups.json') else {}
-            return json.loads(content)
-    except (json.JSONDecodeError, ValueError):
-        return [] if not path.endswith('schedules.json') and not path.endswith('groups.json') else {}
-
-def save_json(path, data):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-
-# ===== OWNER CHECK =====
-def is_owner(user_id):
-    return user_id in OWNER_IDS
-
-# ===== BOT STATE (OFF/ON) =====
-def load_bot_state():
-    if os.path.exists(BOT_STATE_FILE):
-        try:
-            with open(BOT_STATE_FILE, 'r') as f:
-                return json.load(f)
-        except:
-            pass
-    return {"off": False, "reason": "", "expiry": 0}
-
-def save_bot_state(state):
-    with open(BOT_STATE_FILE, 'w') as f:
-        json.dump(state, f, indent=2)
-
-def is_bot_off():
-    """Returns (off, reason, expiry) where off is True if bot is currently off."""
-    state = load_bot_state()
-    if state.get("off", False):
-        expiry = state.get("expiry", 0)
-        if time.time() < expiry:
-            return True, state.get("reason", ""), expiry
+        if region == "IND":
+            with open("token_ind.json", "r") as f:
+                tokens = json.load(f)
+        elif region in {"BR", "US", "SAC", "NA"}:
+            with open("token_br.json", "r") as f:
+                tokens = json.load(f)
         else:
-            # Auto turn on if expired
-            state["off"] = False
-            state["reason"] = ""
-            state["expiry"] = 0
-            save_bot_state(state)
-    return False, "", 0
-
-async def check_bot_off_and_notify(update, context):
-    """Returns True if bot is ON or user is owner. Otherwise sends off message and returns False."""
-    user_id = update.effective_user.id
-    if is_owner(user_id):
-        return True
-    off, reason, expiry = is_bot_off()
-    if off:
-        remaining = max(0, expiry - time.time())
-        hours = int(remaining // 3600)
-        minutes = int((remaining % 3600) // 60)
-        time_str = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
-        await update.message.reply_text(
-            f"⚠️ <b>Bot is currently OFF</b>\n\n"
-            f"📌 <b>Reason:</b> {reason}\n"
-            f"⏳ <b>Will be back in:</b> {time_str}\n\n"
-            f"Please wait until the maintenance is over.",
-            parse_mode='HTML'
-        )
-        return False
-    return True
-
-# ===== ALLOWED GROUPS =====
-def load_allowed_groups():
-    return load_json(ALLOWED_GROUPS_FILE) or {}
-
-def save_allowed_groups(groups):
-    save_json(ALLOWED_GROUPS_FILE, groups)
-
-def get_group_limits(group_id):
-    groups = load_allowed_groups()
-    if str(group_id) in groups:
-        cfg = groups[str(group_id)]
-        return cfg.get('free_limit', FREE_DAILY_LIMIT), cfg.get('vip_limit', VIP_DAILY_LIMIT)
-    return FREE_DAILY_LIMIT, VIP_DAILY_LIMIT
-
-def is_group_allowed(group_id):
-    groups = load_allowed_groups()
-    return str(group_id) in groups
-
-# ===== SETTINGS =====
-def load_settings():
-    if not os.path.exists(SETTINGS_FILE):
-        return {"verification_enabled": True, "channel_verification_enabled": True}
-    try:
-        with open(SETTINGS_FILE, 'r') as f:
-            return json.load(f)
-    except:
-        return {"verification_enabled": True, "channel_verification_enabled": True}
-
-def save_settings(settings):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=2)
-
-# ===== CHANNEL MANAGEMENT =====
-def load_channels():
-    return load_json(CHANNELS_FILE)
-
-def save_channels(channels):
-    save_json(CHANNELS_FILE, channels)
-
-def add_channel(name, link):
-    channels = load_channels()
-    channels = [c for c in channels if c.get('name') != name]
-    channels.append({"name": name, "link": link})
-    save_channels(channels)
-
-def remove_channel(name):
-    channels = load_channels()
-    channels = [c for c in channels if c.get('name') != name]
-    save_channels(channels)
-
-def get_channels():
-    return load_channels()
-
-# ===== USER INFO HELPER =====
-async def get_user_info_async(bot, user_id):
-    try:
-        user = await bot.get_chat(user_id)
-        username = f"@{user.username}" if user.username else f"ID:{user_id}"
-        name = user.full_name or user.first_name or f"User {user_id}"
-        return username, name
-    except:
-        return f"ID:{user_id}", f"User {user_id}"
-
-# ===== SUBSCRIPTION CHECK =====
-async def is_user_subscribed(bot, user_id):
-    settings = load_settings()
-    if not settings.get("channel_verification_enabled", True):
-        return True
-    channels = get_channels()
-    if not channels:
-        return True
-    for ch in channels:
-        try:
-            member = await bot.get_chat_member(chat_id=ch['name'], user_id=user_id)
-            if member.status not in ['member', 'administrator', 'creator']:
-                return False
-        except:
-            return False
-    return True
-
-async def check_subscription_and_notify(update, context):
-    if update.message is None:
-        return False
-    user_id = update.effective_user.id
-    if is_owner(user_id):
-        return True
-    if await is_user_subscribed(context.bot, user_id):
-        return True
-    channels = get_channels()
-    keyboard_buttons = []
-    for ch in channels:
-        keyboard_buttons.append([InlineKeyboardButton(f"📢 JOIN {ch['name']}", url=ch['link'])])
-    keyboard_buttons.append([InlineKeyboardButton("✅ I'VE JOINED", callback_data="check_subscription")])
-    keyboard = InlineKeyboardMarkup(keyboard_buttons)
-    text = "📢 <b>Subscription Required</b>\n\n🔒 To use this bot, you must join all our official channels!\n\n👇 Please join each channel and click <b>I'VE JOINED</b>."
-    if update.message:
-        await update.message.reply_text(text, reply_markup=keyboard, parse_mode='HTML')
-    elif update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=keyboard, parse_mode='HTML')
-    return False
-
-# ===== GROUP ACCESS GUARD =====
-async def check_group_access(update, context):
-    if update.message is None or update.effective_chat is None:
-        return False
-
-    chat = update.effective_chat
-    user_id = update.effective_user.id
-
-    if chat.type == "private":
-        if is_owner(user_id):
-            return True
-        else:
-            try:
-                await update.message.reply_text(
-                    "🔒 <b>Private Access Restricted</b>\n\n"
-                    "This bot is only for the official group:\n"
-                    f"{OFFICIAL_GROUP_LINK}\n\n"
-                    "Please join the group to use the bot.",
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🌟 JOIN GROUP", url=OFFICIAL_GROUP_LINK)]
-                    ])
-                )
-            except Exception:
-                pass
-            return False
-
-    if chat.type in ["group", "supergroup"]:
-        if is_group_allowed(chat.id):
-            return True
-        else:
-            try:
-                await update.message.reply_text(
-                    f"🚫 <b>Group Not Authorized</b>\n\n"
-                    f"This group is not allowed to use the bot.\n"
-                    f"Only groups added by the admin with /addgroup are permitted.\n\n"
-                    f"📌 <b>Group ID:</b> <code>{chat.id}</code>\n\n"
-                    f"If you are the admin, use:\n"
-                    f"<code>/addgroup {chat.id} 1 3</code>\n"
-                    f"(free_limit=1, vip_limit=3) or adjust limits as needed.\n\n"
-                    f"Or run <code>/addgroup</code> without arguments in this group to add it with default limits.",
-                    parse_mode='HTML',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🌟 JOIN OFFICIAL GROUP", url=OFFICIAL_GROUP_LINK)]
-                    ])
-                )
-            except Exception:
-                pass
-            return False
-
-    return False
-
-# ===== /id COMMAND =====
-async def id_command(update, context):
-    if update.message is None:
-        return
-    if not await check_bot_off_and_notify(update, context):
-        return
-    chat = update.effective_chat
-    user = update.effective_user
-    chat_id = chat.id
-    user_id = user.id
-    text = f"📌 <b>Chat ID:</b> <code>{chat_id}</code>\n👤 <b>Your ID:</b> <code>{user_id}</code>"
-    await update.message.reply_text(text, parse_mode='HTML')
-
-# ===== TOKEN SYSTEM (Verification) =====
-def generate_verification_token(length=16):
-    return ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(length))
-
-def save_verification_token(user_id, uid, region):
-    tokens = load_json(TOKEN_FILE)
-    tokens = [t for t in tokens if t["user_id"] != user_id]
-    token = generate_verification_token()
-    expiry_time = datetime.now() + timedelta(minutes=10)
-    tokens.append({
-        "user_id": user_id,
-        "token": token,
-        "uid": uid,
-        "region": region,
-        "expiry": expiry_time.isoformat(),
-        "used": False
-    })
-    save_json(TOKEN_FILE, tokens)
-    return token
-
-def get_token_data(token):
-    tokens = load_json(TOKEN_FILE)
-    for t in tokens:
-        if t["token"] == token and not t["used"]:
-            expiry = datetime.fromisoformat(t["expiry"])
-            if datetime.now() > expiry:
-                return None
-            t["used"] = True
-            save_json(TOKEN_FILE, tokens)
-            return t
-    return None
-
-# ===== VERIFIED USERS =====
-def load_verified_users():
-    return load_json(VERIFIED_FILE)
-
-def save_verified_user(user_id, uid=None, region=None):
-    users = load_verified_users()
-    now = datetime.now().isoformat()
-    for u in users:
-        if u["id"] == user_id:
-            u["timestamp"] = now
-            if uid: u["uid"] = uid
-            if region: u["region"] = region
-            break
-    else:
-        users.append({"id": user_id, "timestamp": now, "uid": uid, "region": region})
-    save_json(VERIFIED_FILE, users)
-
-def is_user_verified_recently(user_id):
-    users = load_verified_users()
-    for u in users:
-        if u["id"] == user_id:
-            ts = datetime.fromisoformat(u["timestamp"])
-            return datetime.now() - ts < timedelta(hours=12)
-    return False
-
-# ===== DAILY USAGE =====
-def load_daily_usage():
-    return load_json(USAGE_FILE)
-
-def save_daily_usage(user_id):
-    usage = load_daily_usage()
-    today = datetime.now().strftime("%Y-%m-%d")
-    for u in usage:
-        if u["id"] == user_id and u["date"] == today:
-            u["count"] = u.get("count", 0) + 1
-            break
-    else:
-        usage.append({"id": user_id, "date": today, "count": 1})
-    save_json(USAGE_FILE, usage)
-
-def get_today_usage_count(user_id):
-    usage = load_daily_usage()
-    today = datetime.now().strftime("%Y-%m-%d")
-    for u in usage:
-        if u["id"] == user_id and u["date"] == today:
-            return u.get("count", 0)
-    return 0
-
-def has_reached_daily_limit(user_id, group_id=None):
-    if is_owner(user_id):
-        return False
-    used = get_today_usage_count(user_id)
-    if is_vip_user(user_id):
-        if group_id and is_group_allowed(group_id):
-            _, vip_limit = get_group_limits(group_id)
-        else:
-            vip_limit = VIP_DAILY_LIMIT
-        return used >= vip_limit
-    else:
-        if group_id and is_group_allowed(group_id):
-            free_limit, _ = get_group_limits(group_id)
-        else:
-            free_limit = FREE_DAILY_LIMIT
-        return used >= free_limit
-
-def get_user_remaining(user_id, group_id=None):
-    if is_owner(user_id):
-        return None, None
-    used = get_today_usage_count(user_id)
-    if is_vip_user(user_id):
-        if group_id and is_group_allowed(group_id):
-            _, limit = get_group_limits(group_id)
-        else:
-            limit = VIP_DAILY_LIMIT
-    else:
-        if group_id and is_group_allowed(group_id):
-            limit, _ = get_group_limits(group_id)
-        else:
-            limit = FREE_DAILY_LIMIT
-    remaining = max(0, limit - used)
-    return remaining, limit
-
-# ===== VIP LOGIC =====
-def load_vip_users():
-    return load_json(VIP_FILE)
-
-def save_vip_user(user_id, days, like_limit):
-    vip_users = load_vip_users()
-    expiry_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
-    for user in vip_users:
-        if user["id"] == user_id:
-            user["expiry"] = expiry_date
-            user["like_limit"] = like_limit
-            break
-    else:
-        vip_users.append({"id": user_id, "expiry": expiry_date, "like_limit": like_limit})
-    save_json(VIP_FILE, vip_users)
-
-def remove_vip_user(user_id):
-    vip_users = load_vip_users()
-    vip_users = [u for u in vip_users if u["id"] != user_id]
-    save_json(VIP_FILE, vip_users)
-
-def is_vip_user(user_id):
-    vip_users = load_vip_users()
-    for user in vip_users:
-        if user["id"] == user_id:
-            expiry_date = datetime.strptime(user["expiry"], "%Y-%m-%d")
-            return datetime.now() < expiry_date
-    return False
-
-# =====================================================================
-# ===== DIRECT LIKE SENDING =====
-# =====================================================================
-
-def encrypt_message(plaintext: bytes) -> bytes:
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_IV)
-    padded_message = pad(plaintext, AES.block_size)
-    return cipher.encrypt(padded_message)
-
-def encrypt_message_hex(plaintext: bytes) -> str:
-    return binascii.hexlify(encrypt_message(plaintext)).decode('utf-8')
-
-def load_accounts_json(server_name: str) -> list:
-    try:
-        filename = "accounts_ind.json" if server_name == "IND" else "accounts_bd.json"
-        if not os.path.exists(filename):
-            return []
-        with open(filename, "r") as f:
-            data = json.load(f)
-            accounts = []
-            for uid, password in data.items():
-                if uid and password:
-                    accounts.append({"uid": str(uid).strip(), "password": str(password).strip()})
-            return accounts
-    except:
-        return []
-
-def load_all_accounts(server_name: str = "BD") -> list:
-    return load_accounts_json(server_name)
-
-def get_token_from_cache(uid: str, server: str = "BD") -> str | None:
-    cache = token_cache_ind if server == "IND" else token_cache
-    if uid in cache:
-        data = cache[uid]
-        if time.time() < data.get('expiry', 0):
-            return data.get('token')
-        else:
-            del cache[uid]
-            save_token_cache(server)
-    return None
-
-def set_token_in_cache(uid: str, token: str, server: str = "BD"):
-    cache = token_cache_ind if server == "IND" else token_cache
-    cache[uid] = {"token": token, "expiry": time.time() + CACHE_DURATION}
-    save_token_cache(server)
-
-def save_token_cache(server: str = "BD"):
-    file = TOKEN_CACHE_IND_FILE if server == "IND" else TOKEN_CACHE_FILE
-    data = token_cache_ind if server == "IND" else token_cache
-    with open(file, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_token_cache(server: str = "BD"):
-    cache = token_cache_ind if server == "IND" else token_cache
-    file = TOKEN_CACHE_IND_FILE if server == "IND" else TOKEN_CACHE_FILE
-    if os.path.exists(file):
-        try:
-            with open(file, "r") as f:
-                cache.update(json.load(f))
-        except:
-            pass
-
-async def generate_jwt_token(uid: str, password: str, server: str = "BD", force_refresh: bool = False, retry_count: int = 0) -> str | None:
-    if not force_refresh:
-        cached = get_token_from_cache(uid, server)
-        if cached:
-            return cached
-    for attempt in range(retry_count, 3):
-        try:
-            async with aiohttp.ClientSession() as session:
-                oauth_resp = await session.post(
-                    "https://100067.connect.garena.com/oauth/guest/token/grant",
-                    data={
-                        'uid': uid, 'password': password, 'response_type': "token",
-                        'client_type': "2",
-                        'client_secret': "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-                        'client_id': "100067"
-                    },
-                    headers={'User-Agent': "GarenaMSDK/4.0.19P9(SM-M526B ;Android 13;pt;BR;)"},
-                    timeout=30
-                )
-                if oauth_resp.status != 200:
-                    await asyncio.sleep(0.5)
-                    continue
-                oauth_data = await oauth_resp.json()
-                access_token = oauth_data.get('access_token')
-                open_id = oauth_data.get('open_id')
-                if not access_token or not open_id:
-                    await asyncio.sleep(0.5)
-                    continue
-
-                for platform in [8, 3, 4, 6]:
-                    try:
-                        game_data = my_pb2.GameData()
-                        game_data.timestamp = "2024-12-05 18:15:32"
-                        game_data.game_name = "free fire"
-                        game_data.game_version = 1
-                        game_data.version_code = "1.126.1"
-                        game_data.os_info = "Android OS 9 / API-28 (PI/rel.cjw.20220518.114133)"
-                        game_data.device_type = "Handheld"
-                        game_data.network_provider = "Verizon Wireless"
-                        game_data.connection_type = "WIFI"
-                        game_data.screen_width = 1280
-                        game_data.screen_height = 960
-                        game_data.dpi = "240"
-                        game_data.cpu_info = "ARMv7 VFPv3 NEON VMH | 2400 | 4"
-                        game_data.total_ram = 5951
-                        game_data.gpu_name = "Adreno (TM) 640"
-                        game_data.gpu_version = "OpenGL ES 3.0"
-                        game_data.user_id = "Google|74b585a9-0268-4ad3-8f36-ef41d2e53610"
-                        game_data.ip_address = "172.190.111.97"
-                        game_data.language = "en"
-                        game_data.open_id = open_id
-                        game_data.access_token = access_token
-                        game_data.platform_type = platform
-                        game_data.field_99 = str(platform)
-                        game_data.field_100 = str(platform)
-
-                        encrypted = encrypt_message(game_data.SerializeToString())
-                        login_resp = await session.post(
-                            "https://loginbp.ggpolarbear.com/MajorLogin",
-                            data=encrypted,
-                            headers={
-                                'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-                                'Content-Type': "application/octet-stream",
-                                'X-Unity-Version': "2018.4.11f1",
-                                'X-GA': "v1 1",
-                                'ReleaseVersion': "OB55"
-                            },
-                            timeout=30
-                        )
-                        if login_resp.status == 200:
-                            content = await login_resp.read()
-                            msg = output_pb2.Garena_420()
-                            msg.ParseFromString(content)
-                            token = getattr(msg, "token", None)
-                            if token:
-                                set_token_in_cache(uid, token, server)
-                                return token
-                    except:
-                        continue
-            await asyncio.sleep(0.5)
-        except:
-            await asyncio.sleep(0.5)
-    return None
-
-def create_protobuf_message(user_id: int, region: str) -> bytes:
-    msg = like_pb2.like()
-    msg.uid = user_id
-    msg.region = region
-    return msg.SerializeToString()
-
-def enc(uid: str) -> str:
-    msg = uid_generator_pb2.uid_generator()
-    msg.krishna_ = int(uid)
-    msg.teamXdarks = 1
-    return encrypt_message_hex(msg.SerializeToString())
-
-def decode_protobuf(binary: bytes):
-    try:
-        items = like_count_pb2.Info()
-        items.ParseFromString(binary)
-        return items
-    except:
-        return None
-
-def get_player_info(encrypted_uid: str, server_name: str, token: str):
-    url_map = {
-        'IND': 'https://client.ind.freefiremobile.com/GetPlayerPersonalShow',
-        'BR': 'https://client.us.freefiremobile.com/GetPlayerPersonalShow',
-        'US': 'https://client.us.freefiremobile.com/GetPlayerPersonalShow',
-        'ME': 'https://client.me.freefiremobile.com/GetPlayerPersonalShow'
-    }
-    url = url_map.get(server_name, 'https://clientbp.ggpolarbear.com/GetPlayerPersonalShow')
-    edata = bytes.fromhex(encrypted_uid)
-    headers = {
-        'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-        'Authorization': f"Bearer {token}",
-        'Content-Type': "application/x-www-form-urlencoded",
-        'X-GA': "v1 1",
-        'ReleaseVersion': "OB55"
-    }
-    try:
-        import urllib3
-        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=30)
-        return decode_protobuf(resp.content)
-    except:
-        return None
-
-async def send_like_with_token(encrypted_uid: str, token: str, url: str, retry_count: int = 0) -> int:
-    for attempt in range(retry_count, 3):
-        try:
-            edata = bytes.fromhex(encrypted_uid)
-            headers = {
-                'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
-                'Authorization': f"Bearer {token}",
-                'Content-Type': "application/x-www-form-urlencoded",
-                'X-GA': "v1 1",
-                'ReleaseVersion': "OB55"
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, data=edata, headers=headers, timeout=30) as resp:
-                    if resp.status == 200:
-                        return 200
-                    elif resp.status in [401, 403]:
-                        return resp.status
-                    await asyncio.sleep(0.3)
-        except:
-            await asyncio.sleep(0.3)
-    return 500
-
-async def process_account(target_uid: str, encrypted_uid: str, account: dict, url: str, semaphore: asyncio.Semaphore, server: str = "BD") -> Tuple[int, str]:
-    async with semaphore:
-        token = get_token_from_cache(account['uid'], server)
-        if not token:
-            token = await generate_jwt_token(account['uid'], account['password'], server, force_refresh=True)
-            if not token:
-                return 500, account['uid']
-        for attempt in range(2):
-            status = await send_like_with_token(encrypted_uid, token, url, attempt)
-            if status == 200:
-                return 200, account['uid']
-            elif status in [401, 403]:
-                token = await generate_jwt_token(account['uid'], account['password'], server, force_refresh=True)
-                if not token:
-                    return 500, account['uid']
-                continue
-            await asyncio.sleep(0.3)
-        return 500, account['uid']
-
-async def send_single_like(target_uid: str, server_name: str, like_url: str) -> dict:
-    region = server_name
-    proto_msg = create_protobuf_message(int(target_uid), region)
-    encrypted_uid = encrypt_message_hex(proto_msg)
-    accounts = load_all_accounts(server_name)
-    if not accounts:
-        return {'success': 0, 'failed': 0, 'total': 0}
-    random.shuffle(accounts)
-    semaphore = asyncio.Semaphore(800)
-    tasks = [process_account(target_uid, encrypted_uid, acc, like_url, semaphore, server_name) for acc in accounts]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    successful = sum(1 for r in results if isinstance(r, tuple) and r[0] == 200)
-    failed = len(results) - successful
-    return {'success': successful, 'failed': failed, 'total': len(accounts)}
-
-def get_like_url(server: str) -> str:
-    if server == "IND":
-        return "https://client.ind.freefiremobile.com/LikeProfile"
-    elif server in {"BR", "US", "SAC", "NA"}:
-        return "https://client.us.freefiremobile.com/LikeProfile"
-    elif server == "ME":
-        return "https://client.me.freefiremobile.com/LikeProfile"
-    else:
-        return "https://clientbp.ggpolarbear.com/LikeProfile"
-
-async def call_like_api(region: str, uid: str) -> dict:
-    region_upper = region.upper()
-    like_url = get_like_url(region_upper)
-    accounts = load_all_accounts(region_upper)
-    
-    if not accounts:
-        return {"status": 0, "message": f"No accounts for {region_upper}", "LikesafterCommand": 0, "LikesbeforeCommand": 0, "PlayerNickname": "N/A", "UID": uid, "LikesGivenByAPI": 0}
-    
-    first_account = accounts[0]
-    temp_token = get_token_from_cache(first_account['uid'], region_upper)
-    if not temp_token:
-        temp_token = await generate_jwt_token(first_account['uid'], first_account['password'], region_upper, force_refresh=True)
-        if not temp_token:
-            return {"status": 0, "message": f"Token generation failed for {first_account['uid']}", "LikesafterCommand": 0, "LikesbeforeCommand": 0, "PlayerNickname": "N/A", "UID": uid, "LikesGivenByAPI": 0}
-    
-    encrypted_uid = enc(uid)
-    before_info = get_player_info(encrypted_uid, region_upper, temp_token)
-    if before_info is None:
-        return {"status": 0, "message": "Invalid UID or server. Please check UID and region.", "LikesafterCommand": 0, "LikesbeforeCommand": 0, "PlayerNickname": "N/A", "UID": uid, "LikesGivenByAPI": 0}
-    
-    before_data = json.loads(MessageToJson(before_info))
-    before_likes = int(before_data['AccountInfo'].get('Likes', 0))
-    player_name = before_data['AccountInfo'].get('PlayerNickname', 'Unknown')
-    
-    result = await send_single_like(uid, region_upper, like_url)
-    
-    after_likes = before_likes
-    after_info = None
-    for _ in range(3):
-        after_info = get_player_info(encrypted_uid, region_upper, temp_token)
-        if after_info is not None:
-            break
-        await asyncio.sleep(0.5)
-    
-    if after_info:
-        after_data = json.loads(MessageToJson(after_info))
-        after_likes = int(after_data['AccountInfo'].get('Likes', 0))
-    
-    likes_given = after_likes - before_likes
-    
-    if likes_given <= 0:
-        if before_likes >= MAX_LIKES:
-            status = 2
-            message = "🎉 Player already has maximum likes!"
-        else:
-            status = 2
-            message = (
-                "⚠️ No likes were given.\n\n"
-                "Possible reasons:\n"
-                "• These accounts may have already liked this UID today.\n"
-                "• The UID might be restricted from receiving likes.\n"
-                "• Try again tomorrow or use a different UID."
-            )
-        return {
-            "status": status,
-            "LikesGivenByAPI": 0,
-            "LikesbeforeCommand": before_likes,
-            "LikesafterCommand": after_likes,
-            "PlayerNickname": player_name,
-            "UID": uid,
-            "Region": region_upper,
-            "Success": result.get('success', 0),
-            "Failed": result.get('failed', 0),
-            "message": message
-        }
-    
-    return {
-        "status": 1,
-        "LikesGivenByAPI": likes_given,
-        "LikesbeforeCommand": before_likes,
-        "LikesafterCommand": after_likes,
-        "PlayerNickname": player_name,
-        "UID": uid,
-        "Region": region_upper,
-        "Success": result.get('success', 0),
-        "Failed": result.get('failed', 0),
-        "message": "✅ Success"
-    }
-
-# ===== TOKEN REFRESH =====
-async def refresh_all_tokens(context: ContextTypes.DEFAULT_TYPE = None, server: str = "BD"):
-    async with token_refresh_lock:
-        app = context.bot_data.get('app') if context else None
-        all_accounts = load_all_accounts(server)
-        if not all_accounts:
-            return 0, 0
-        semaphore = asyncio.Semaphore(800)
-        success_count = 0
-        async def refresh_single(account: dict):
-            nonlocal success_count
-            async with semaphore:
-                for attempt in range(2):
-                    token = await generate_jwt_token(account['uid'], account['password'], server, force_refresh=True, retry_count=attempt)
-                    if token:
-                        success_count += 1
-                        return True
-                    await asyncio.sleep(0.3)
-                return False
-        await asyncio.gather(*[refresh_single(acc) for acc in all_accounts])
-        failed_count = len(all_accounts) - success_count
-        if app:
-            current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-            msg = f"""🔄 Token Refresh Complete!
-
-📁 {server} Server:
-✅ Success: {success_count}
-❌ Failed: {failed_count}
-📊 Total: {len(all_accounts)}
-⏰ Time: {current_time}
-
-{'✅ All tokens refreshed successfully!' if failed_count == 0 else f'⚠️ {failed_count} accounts failed'}"""
-            try:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode='HTML')
-            except:
-                pass
-        return success_count, failed_count
-
-async def refresh_all_tokens_internal(app, server: str = "BD"):
-    async with token_refresh_lock:
-        all_accounts = load_all_accounts(server)
-        if not all_accounts:
-            print(f"[{datetime.now(BD_TZ)}] ❌ No {server} accounts found")
-            return 0, 0
-        
-        total = len(all_accounts)
-        print(f"[{datetime.now(BD_TZ)}] 🔄 Refreshing {server} tokens ({total} accounts)...")
-        
-        semaphore = asyncio.Semaphore(800)
-        success_count = 0
-        failed_uids = []
-        processed = 0
-        
-        async def refresh_single(account: dict):
-            nonlocal success_count, processed
-            async with semaphore:
-                uid = account['uid']
-                processed += 1
-                if processed % 20 == 0 or processed == total:
-                    print(f"[{datetime.now(BD_TZ)}] 📊 Progress: {processed}/{total} {server} accounts")
-                
-                for attempt in range(2):
-                    token = await generate_jwt_token(uid, account['password'], server, force_refresh=True, retry_count=attempt)
-                    if token:
-                        success_count += 1
-                        if success_count <= 5 or success_count > total - 5:
-                            print(f"[{datetime.now(BD_TZ)}] ✅ {server} UID {uid} → Token generated")
-                        return True
-                    await asyncio.sleep(0.3)
-                
-                failed_uids.append(uid)
-                print(f"[{datetime.now(BD_TZ)}] ❌ {server} UID {uid} → Failed")
-                return False
-        
-        tasks = [refresh_single(acc) for acc in all_accounts]
-        await asyncio.gather(*tasks)
-        
-        failed_count = total - success_count
-        
-        print(f"[{datetime.now(BD_TZ)}] ✅ {server} Token Refresh Complete!")
-        print(f"[{datetime.now(BD_TZ)}] 📊 {server}: {success_count} success, {failed_count} failed out of {total}")
-        if failed_uids:
-            print(f"[{datetime.now(BD_TZ)}] ❌ Failed UIDs ({len(failed_uids)}): {', '.join(failed_uids[:10])}{'...' if len(failed_uids) > 10 else ''}")
-        
-        if app:
-            current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-            msg = f"""🔄 Token Refresh Complete!
-
-📁 {server} Server:
-✅ Success: {success_count}
-❌ Failed: {failed_count}
-📊 Total: {total}
-⏰ Time: {current_time}
-
-{'✅ All tokens refreshed successfully!' if failed_count == 0 else f'⚠️ {failed_count} accounts failed'}"""
-            try:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=msg, parse_mode='HTML')
-            except:
-                pass
-        
-        return success_count, failed_count
-
-# =====================================================================
-# ===== ADMIN COMMANDS =====
-# =====================================================================
-
-async def off_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "❌ <b>Usage:</b> <code>/off &lt;reason&gt; &lt;time&gt;</code>\n"
-            "Example: <code>/off Maintenance 2h</code>\n"
-            "Time format: e.g., 30m, 2h, 1d",
-            parse_mode='HTML'
-        )
-        return
-    reason = " ".join(args[:-1])
-    time_str = args[-1]
-    # parse time
-    match = re.match(r'^(\d+)([hmd])$', time_str)
-    if not match:
-        await update.message.reply_text(
-            "❌ <b>Invalid time format.</b>\n"
-            "Use e.g., <code>30m</code> (minutes), <code>2h</code> (hours), <code>1d</code> (days).",
-            parse_mode='HTML'
-        )
-        return
-    value = int(match.group(1))
-    unit = match.group(2)
-    if unit == 'h':
-        seconds = value * 3600
-    elif unit == 'm':
-        seconds = value * 60
-    elif unit == 'd':
-        seconds = value * 86400
-    else:
-        seconds = value * 60  # fallback
-    expiry = time.time() + seconds
-    state = load_bot_state()
-    state["off"] = True
-    state["reason"] = reason
-    state["expiry"] = expiry
-    save_bot_state(state)
-    expiry_dt = datetime.fromtimestamp(expiry, tz=BD_TZ)
-    await update.message.reply_text(
-        f"✅ <b>Bot is now OFF</b>\n\n"
-        f"📌 <b>Reason:</b> {reason}\n"
-        f"⏳ <b>Will be back at:</b> {expiry_dt.strftime('%I:%M %p %d-%m-%Y')} BST\n"
-        f"⏱️ <b>Duration:</b> {time_str}\n\n"
-        f"All users will see the off message until then.",
-        parse_mode='HTML'
-    )
-
-async def on_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    state = load_bot_state()
-    state["off"] = False
-    state["reason"] = ""
-    state["expiry"] = 0
-    save_bot_state(state)
-    await update.message.reply_text("✅ <b>Bot is now ON</b>\nAll features have been resumed.", parse_mode='HTML')
-
-async def refreshtoken_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    msg = await update.message.reply_text("🔄 Refreshing all tokens for all servers... (all accounts at a time)", parse_mode='HTML')
-    total_success = 0
-    total_accounts = 0
-
-    bd_accounts = load_all_accounts("BD")
-    if bd_accounts:
-        await msg.edit_text(f"🔄 Refreshing BD tokens... (1/{len(bd_accounts)})", parse_mode='HTML')
-        success, failed = await refresh_all_tokens(context, "BD")
-        total_success += success
-        total_accounts += len(bd_accounts)
-        current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-        await msg.edit_text(f"""✅ BD Token Refresh Complete!
-
-✅ Success: {success}
-❌ Failed: {failed}
-📊 Total: {len(bd_accounts)}
-⏰ Time: {current_time}""", parse_mode='HTML')
-        await asyncio.sleep(1)
-
-    ind_accounts = load_all_accounts("IND")
-    if ind_accounts:
-        await msg.edit_text(f"🔄 Refreshing IND tokens... (1/{len(ind_accounts)})", parse_mode='HTML')
-        success, failed = await refresh_all_tokens(context, "IND")
-        total_success += success
-        total_accounts += len(ind_accounts)
-        current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-        await msg.edit_text(f"""✅ IND Token Refresh Complete!
-
-✅ Success: {success}
-❌ Failed: {failed}
-📊 Total: {len(ind_accounts)}
-⏰ Time: {current_time}""", parse_mode='HTML')
-        await asyncio.sleep(1)
-
-    current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-    await msg.edit_text(f"""✅ All Token Refresh Complete!
-
-📊 Total Success: {total_success}
-📊 Total Accounts: {total_accounts}
-⏰ Time: {current_time}
-
-💡 All tokens will auto-refresh every 7 hours
-📦 Processing 250 accounts at a time""", parse_mode='HTML')
-
-async def refreshbd_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    msg = await update.message.reply_text("🔄 Refreshing BD tokens... (all accounts at a time)", parse_mode='HTML')
-    success, failed = await refresh_all_tokens(context, "BD")
-    current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-    await msg.edit_text(f"""✅ BD Token Refresh Complete!
-
-✅ Success: {success}
-❌ Failed: {failed}
-📊 Total: {success + failed}
-⏰ Time: {current_time}
-💡 All tokens will auto-refresh every 7 hours
-📦 Processing 250 accounts at a time""", parse_mode='HTML')
-
-async def refreshind_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    msg = await update.message.reply_text("🔄 Refreshing IND tokens... (all accounts at a time)", parse_mode='HTML')
-    success, failed = await refresh_all_tokens(context, "IND")
-    current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-    await msg.edit_text(f"""✅ IND Token Refresh Complete!
-
-✅ Success: {success}
-❌ Failed: {failed}
-📊 Total: {success + failed}
-⏰ Time: {current_time}
-💡 All tokens will auto-refresh every 7 hours
-📦 Processing 250 accounts at a time""", parse_mode='HTML')
-
-async def tokenstatus_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    bd_total = len(token_cache)
-    bd_valid = sum(1 for v in token_cache.values() if time.time() < v.get('expiry', 0))
-    ind_total = len(token_cache_ind)
-    ind_valid = sum(1 for v in token_cache_ind.values() if time.time() < v.get('expiry', 0))
-    bd_accounts = len(load_all_accounts("BD"))
-    ind_accounts = len(load_all_accounts("IND"))
-    current_time = datetime.now(BD_TZ).strftime('%I:%M:%S %p BST')
-    msg = f"""📊 Token Cache Status - {current_time}
-
-📁 BD ({TOKEN_CACHE_FILE}):
-   📦 Cached: {bd_total}
-   ✅ Valid: {bd_valid}
-   ❌ Expired: {bd_total - bd_valid}
-   📊 Accounts: {bd_accounts}
-
-📁 IND ({TOKEN_CACHE_IND_FILE}):
-   📦 Cached: {ind_total}
-   ✅ Valid: {ind_valid}
-   ❌ Expired: {ind_total - ind_valid}
-   📊 Accounts: {ind_accounts}
-
-⏰ Token Validity: 7 hours
-📦 Processing: 250 accounts at a time"""
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-async def clearcache_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    if len(context.args) and context.args[0].lower() == "confirm":
-        token_cache.clear()
-        token_cache_ind.clear()
-        for cache_file in [TOKEN_CACHE_FILE, TOKEN_CACHE_IND_FILE]:
-            if os.path.exists(cache_file):
-                with open(cache_file, "w") as f:
-                    json.dump({}, f)
-        await update.message.reply_text("✅ All cache cleared!", parse_mode='HTML')
-    else:
-        await update.message.reply_text("⚠️ Clear all cache? Use: /clearcache confirm", parse_mode='HTML')
-
-async def reloadaccounts_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    token_cache.clear()
-    token_cache_ind.clear()
-    for cache_file in [TOKEN_CACHE_FILE, TOKEN_CACHE_IND_FILE]:
-        if os.path.exists(cache_file):
-            with open(cache_file, "w") as f:
-                json.dump({}, f)
-    bd_accounts = len(load_all_accounts("BD"))
-    ind_accounts = len(load_all_accounts("IND"))
-    await update.message.reply_text(f"""✅ Accounts reloaded!
-
-📁 BD: {bd_accounts} accounts
-📁 IND: {ind_accounts} accounts""", parse_mode='HTML')
-
-# =====================================================================
-# ===== AUTO-LIKE =====
-# =====================================================================
-
-def load_autolike_schedules():
-    return load_json(AUTOLIKE_SCHEDULES_FILE)
-
-def save_autolike_schedules(schedules):
-    save_json(AUTOLIKE_SCHEDULES_FILE, schedules)
-
-def load_autolike_logs():
-    return load_json(AUTOLIKE_LOGS_FILE)
-
-def save_autolike_logs(logs):
-    save_json(AUTOLIKE_LOGS_FILE, logs)
-
-def add_autolike_log(uid, region, status, message, likes_before=0, likes_after=0):
-    logs = load_autolike_logs()
-    logs.append({
-        "uid": uid,
-        "region": region,
-        "status": status,
-        "message": message,
-        "likes_before": likes_before,
-        "likes_after": likes_after,
-        "timestamp": datetime.now(BD_TZ).strftime("%Y-%m-%d %H:%M:%S")
-    })
-    if len(logs) > 200:
-        logs = logs[-200:]
-    save_autolike_logs(logs)
-
-async def process_autolike():
-    global bot_app
-    if bot_app is None:
-        return
-    bot = bot_app.bot
-    schedules = load_autolike_schedules()
-    now_ts = time.time()
-    remove_keys = []
-    for key, entry in schedules.items():
-        if entry.get('end_ts', 0) < now_ts:
-            remove_keys.append(key)
-            continue
-        region = entry['region']
-        uid = entry['uid']
-        res = await call_like_api(region, uid)
-        status = int(res.get('status', 0)) if isinstance(res, dict) else 0
-        if status == 1:
-            likes_given = res.get('LikesGivenByAPI', 0)
-            likes_before = res.get('LikesbeforeCommand', 0)
-            likes_after = res.get('LikesafterCommand', 0)
-            player_name = res.get('PlayerNickname', 'N/A')
-            customer_name = entry.get('customer_name', 'N/A')
-            end_ts = entry.get('end_ts', 0)
-            days_remaining = max(0, (end_ts - time.time()) // 86400)
-            days_remaining_text = f"{int(days_remaining)} day{'s' if days_remaining != 1 else ''}" if days_remaining > 0 else "Expired"
-
-            setter = "N/A"
-            try:
-                if entry.get('created_by'):
-                    setter = f"ID:{entry['created_by']}"
-            except:
-                setter = "N/A"
-
-            msg = (
-                "╔══════🌟👑🌟══════╗\n"
-                "     ✨ <b>AUTO LIKE SUCCESS</b> ✨\n"
-                "╚══════🌟👑🌟══════╝\n\n"
-                "🏆 <b>PLAYER DETAILS</b>\n"
-                "╭──────────────────╮\n"
-                f"  🪪 <b>Name:</b> <code>{html.escape(str(player_name))}</code>\n"
-                f"  🆔 <b>UID:</b> <code>{entry['uid']}</code>\n"
-                f"  🌍 <b>Region:</b> <code>{entry['region'].upper()}</code>\n"
-                "╰──────────────────╯\n\n"
-                "💎 <b>LIKE DETAILS</b>\n"
-                "╭───────────╮\n"
-                f"  🎯 <b>Sent:</b> <code>{likes_given}</code>\n"
-                f"  📊 <b>Before:</b> <code>{likes_before}</code>\n"
-                f"  📈 <b>After:</b> <code>{likes_after}</code>\n"
-                "╰───────────╯\n\n"
-                f"👤 <b>Set by:</b> {setter}\n"
-                f"🧑 <b>Customer name:</b> {html.escape(customer_name)}\n"
-                f"📅 <b>Day remained:</b> {days_remaining_text}\n"
-                f"⏰ <b>Time:</b> {datetime.now(BD_TZ).strftime('%H:%M')}\n\n"
-                "<b>JOIN</b> @Rn_Official FOR UPDATE\n"
-            )
-            add_autolike_log(uid, region, 'SUCCESS', f"Sent {likes_given} likes", likes_before, likes_after)
-        else:
-            error_msg = res.get('message', 'Unknown error')
-            customer_name = entry.get('customer_name', 'N/A')
-            msg = (
-                "╔═════════════⚠️❌⚠️═════════════╗\n"
-                "           <b>🚫 AUTO-LIKE FAILED 🚫</b>\n"
-                "╚═════════════⚠️❌⚠️═════════════╝\n\n"
-                f"🆔 <b>UID:</b> <code>{entry['uid']}</code>\n"
-                f"🌍 <b>Region:</b> 🌐 <code>{entry['region'].upper()}</code>\n"
-                f"🧑 <b>Customer name:</b> {html.escape(customer_name)}\n"
-                f"⏰ <b>Time:</b> 🕒 {datetime.now(BD_TZ).strftime('%H:%M')}\n\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>Player Name:</b> ✨ <code>{res.get('PlayerNickname','Unknown')}</code>\n"
-                f"👍 <b>Likes:</b> 💖 <code>{res.get('LikesbeforeCommand','N/A')} → {res.get('LikesafterCommand','N/A')}</code>\n"
-                f"📤 <b>Likes Sent By API:</b> 🚀 <code>{res.get('LikesGivenByAPI','N/A')}</code>\n"
-                f"📝 <b>Note:</b> 📑 {res.get('message','API FAILED')}\n"
-                f"📊 <b>Status Code:</b> 🔢 {res.get('status','0')}\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                "🔔 <i>Stay updated with</i> 👉 @Rn_Official"
-            )
-            add_autolike_log(uid, region, 'FAILED', error_msg)
-
-        groups = load_allowed_groups()
-        for gid in groups:
-            try:
-                await bot.send_message(chat_id=int(gid), text=msg, parse_mode='HTML', disable_web_page_preview=True)
-            except:
-                pass
-
-        for owner_id in OWNER_IDS:
-            try:
-                await bot.send_message(chat_id=owner_id, text=msg, parse_mode='HTML', disable_web_page_preview=True)
-            except:
-                pass
-
-        entry['last_sent'] = now_ts
-        schedules[key] = entry
-        save_autolike_schedules(schedules)
-
-    for key in remove_keys:
-        schedules.pop(key, None)
-    save_autolike_schedules(schedules)
-
-# ===== AUTO-LIKE COMMANDS =====
-async def set_autolike_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    args = context.args
-    if len(args) < 3:
-        await update.message.reply_text(
-            "❌ <b>Usage:</b> <code>/set_autolike &lt;region&gt; &lt;uid&gt; &lt;days&gt; [customer_name]</code>\n"
-            "Example: <code>/set_autolike bd 123456 30 John Doe</code>",
-            parse_mode='HTML'
-        )
-        return
-    region = args[0].lower()
-    uid = args[1]
-    try:
-        days = int(args[2])
-    except:
-        await update.message.reply_text("❌ Invalid days. Must be an integer.", parse_mode='HTML')
-        return
-    if region not in VALID_REGIONS:
-        await update.message.reply_text(f"❌ Invalid region. Valid: {', '.join(VALID_REGIONS)}", parse_mode='HTML')
-        return
-    customer_name = " ".join(args[3:]) if len(args) > 3 else "N/A"
-
-    key = f"{region}:{uid}"
-    schedules = load_autolike_schedules()
-    end_ts = time.time() + days * 86400
-    schedules[key] = {
-        "region": region,
-        "uid": uid,
-        "end_ts": end_ts,
-        "created_by": update.effective_user.id,
-        "last_sent": 0,
-        "customer_name": customer_name
-    }
-    save_autolike_schedules(schedules)
-    start_date = datetime.now(BD_TZ).strftime('%Y-%m-%d')
-    end_date = (datetime.now(BD_TZ) + timedelta(days=days)).strftime('%Y-%m-%d')
-    time_str = "04:00"
-
-    setter_username, setter_name = await get_user_info_async(context.bot, update.effective_user.id)
-    setter_id = update.effective_user.id
-
-    msg = (
-        "╔══════🌟👑🌟════════╗\n"
-        "     ✨ <b>AUTO-LIKE ACTIVATED</b> ✨\n"
-        "╚══════🌟👑🌟════════╝\n\n"
-        "🏆 <b>TARGET DETAILS</b>\n"
-        "╭──────────────────╮\n"
-        f"  🆔 <b>UID:</b> <code>{uid}</code>\n"
-        f"  🌍 <b>Region:</b> <code>{region}</code>\n"
-        f"  🧑 <b>Customer name:</b> <code>{html.escape(customer_name)}</code>\n"
-        "╰──────────────────╯\n\n"
-        "⚙️ <b>AUTO-LIKE SETTINGS</b>\n"
-        "╭──────────────────╮\n"
-        f"  ⏰ <b>Time:</b> <code>{time_str} (Asia/Dhaka)</code>\n"
-        f"  📅 <b>Duration:</b> <code>{days} days</code>\n"
-        f"  📆 <b>Start:</b> <code>{start_date}</code>\n"
-        f"  🔚 <b>End:</b> <code>{end_date}</code>\n"
-        "╰──────────────────╯\n\n"
-        "👤 <b>SET BY</b>\n"
-        "╭──────────────────╮\n"
-        f"  🪪 <b>Name:</b> <code>{html.escape(setter_name)}</code>\n"
-        f"  🔗 <b>Username:</b> {setter_username}\n"
-        f"  🆔 <b>TG ID:</b> <code>{setter_id}</code>\n"
-        "╰──────────────────╯\n\n"
-        "💡 <i>Auto-like will be sent daily at 04:00 Asia/Dhaka.</i>\n\n"
-        "<b>JOIN</b> @Rn_Official FOR UPDATE"
-    )
-    await update.message.reply_text(msg, parse_mode='HTML')
-
-async def remove_autolike_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/remove_autolike &lt;region&gt; &lt;uid&gt;</code>", parse_mode='HTML')
-        return
-    region = args[0].lower()
-    uid = args[1]
-    key = f"{region}:{uid}"
-    schedules = load_autolike_schedules()
-    if key in schedules:
-        del schedules[key]
-        save_autolike_schedules(schedules)
-        await update.message.reply_text(f"✅ Auto-like removed for {uid} ({region.upper()}).", parse_mode='HTML')
-    else:
-        await update.message.reply_text("⚠️ Schedule not found.", parse_mode='HTML')
-
-async def list_autolike_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    schedules = load_autolike_schedules()
-    if not schedules:
-        await update.message.reply_text("ℹ️ No active auto-like schedules.", parse_mode='HTML')
-        return
-    lines = ["📋 <b>Active Auto-likes</b>:\n"]
-    for key, entry in schedules.items():
-        uid = entry.get('uid', 'N/A')
-        region = entry.get('region', 'N/A')
-        customer = entry.get('customer_name', 'N/A')
-        end_ts = entry.get('end_ts', 0)
-        end_date = datetime.fromtimestamp(end_ts).strftime('%Y-%m-%d') if end_ts else "N/A"
-        last_ts = entry.get('last_sent', 0)
-        last_date = datetime.fromtimestamp(last_ts).strftime('%Y-%m-%d %H:%M') if last_ts else "Never"
-        created_by = entry.get('created_by')
-        creator_info = ""
-        if created_by:
-            try:
-                user = await context.bot.get_chat(created_by)
-                creator_info = f" • Set by: @{user.username}" if user.username else f" • Set by: ID {created_by}"
-            except:
-                creator_info = f" • Set by: ID {created_by}"
-        lines.append(f"• <code>{uid}</code> ({region.upper()}) — {customer} — until <code>{end_date}</code>, last: <code>{last_date}</code>{creator_info}")
-    text = "\n".join(lines)
-    await update.message.reply_text(text, parse_mode='HTML')
-
-async def test_autolike_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/test_autolike &lt;region&gt; &lt;uid&gt;</code>", parse_mode='HTML')
-        return
-    region = args[0].lower()
-    uid = args[1]
-    if region not in VALID_REGIONS:
-        await update.message.reply_text(f"❌ Invalid region. Valid: {', '.join(VALID_REGIONS)}", parse_mode='HTML')
-        return
-    loading_msg = await update.message.reply_text("⏳ Testing auto-like...", parse_mode='HTML')
-    res = await call_like_api(region, uid)
-    status = int(res.get('status', 0)) if isinstance(res, dict) else 0
-    if status == 1:
-        likes_before = res.get('LikesbeforeCommand', 0)
-        likes_after = res.get('LikesafterCommand', 0)
-        likes_given = res.get('LikesGivenByAPI', 0)
-        player_name = res.get('PlayerNickname', 'N/A')
-        add_autolike_log(uid, region, 'SUCCESS', f"Test sent {likes_given} likes", likes_before, likes_after)
-        msg = (
-            f"✅ <b>Test Auto-like SUCCESS</b>\n\n"
-            f"🪪 <b>Player:</b> <code>{html.escape(str(player_name))}</code>\n"
-            f"🆔 <b>UID:</b> <code>{uid}</code>\n"
-            f"🌍 <b>Region:</b> <code>{region.upper()}</code>\n"
-            f"📊 <b>Before:</b> <code>{likes_before}</code> → <b>After:</b> <code>{likes_after}</code>\n"
-            f"🎁 <b>Sent:</b> <code>{likes_given}</code> likes"
-        )
-    else:
-        error_msg = res.get('message', 'Unknown error')
-        add_autolike_log(uid, region, 'FAILED', f"Test failed: {error_msg}")
-        msg = f"❌ <b>Test Auto-like FAILED</b>\n\n🆔 <b>UID:</b> <code>{uid}</code>\n🌍 <b>Region:</b> <code>{region.upper()}</code>\n⚠️ <b>Error:</b> {html.escape(str(error_msg))}"
-    await loading_msg.edit_text(msg, parse_mode='HTML')
-
-async def autolike_logs_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    logs = load_autolike_logs()
-    if not logs:
-        await update.message.reply_text("ℹ️ No auto-like logs available.", parse_mode='HTML')
-        return
-    lines = ["📜 <b>Auto-like Logs (last 30)</b>:\n"]
-    for log in logs[-30:]:
-        lines.append(
-            f"• UID: <code>{log['uid']}</code> ({log['region'].upper()})\n"
-            f"   ⏰ {log['timestamp']}\n"
-            f"   {'✅' if log['status']=='SUCCESS' else '❌'} {log['status']} — {log['message']}"
-        )
-    text = "\n".join(lines)
-    await update.message.reply_text(text, parse_mode='HTML')
-
-# ===== GROUP MANAGEMENT COMMANDS =====
-async def addgroup_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-
-    args = context.args
-    chat = update.effective_chat
-
-    if len(args) == 0:
-        if chat.type in ["group", "supergroup"]:
-            gid = chat.id
-            free_limit = 1
-            vip_limit = 3
-            groups = load_allowed_groups()
-            groups[str(gid)] = {"free_limit": free_limit, "vip_limit": vip_limit}
-            save_allowed_groups(groups)
-            await update.message.reply_text(
-                f"✅ Group <code>{gid}</code> added with Free Limit: {free_limit}, VIP Limit: {vip_limit}.",
-                parse_mode='HTML'
-            )
-        else:
-            await update.message.reply_text(
-                "❌ <b>Usage:</b> <code>/addgroup &lt;group_id&gt; &lt;free_limit&gt; &lt;vip_limit&gt;</code>\n"
-                "Or run <code>/addgroup</code> in a group to add it automatically.",
-                parse_mode='HTML'
-            )
-        return
-
-    if len(args) < 3:
-        await update.message.reply_text(
-            "❌ <b>Usage:</b> <code>/addgroup &lt;group_id&gt; &lt;free_limit&gt; &lt;vip_limit&gt;</code>\n"
-            "Example: <code>/addgroup -100123456789 2 15</code>",
-            parse_mode='HTML'
-        )
-        return
-
-    try:
-        gid = int(args[0])
-        free_limit = int(args[1])
-        vip_limit = int(args[2])
-    except:
-        await update.message.reply_text("❌ Invalid arguments. Must be integers.", parse_mode='HTML')
-        return
-
-    if free_limit < 0 or vip_limit < 0:
-        await update.message.reply_text("❌ Limits must be non-negative.", parse_mode='HTML')
-        return
-
-    groups = load_allowed_groups()
-    groups[str(gid)] = {"free_limit": free_limit, "vip_limit": vip_limit}
-    save_allowed_groups(groups)
-    await update.message.reply_text(
-        f"✅ Group <code>{gid}</code> added with Free Limit: {free_limit}, VIP Limit: {vip_limit}.",
-        parse_mode='HTML'
-    )
-
-async def removegroup_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    args = context.args
-    if len(args) < 1:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/removegroup &lt;group_id&gt;</code>", parse_mode='HTML')
-        return
-    try:
-        gid = int(args[0])
-    except:
-        await update.message.reply_text("❌ Invalid group ID.", parse_mode='HTML')
-        return
-    groups = load_allowed_groups()
-    if str(gid) in groups:
-        del groups[str(gid)]
-        save_allowed_groups(groups)
-        await update.message.reply_text(f"✅ Group <code>{gid}</code> removed.", parse_mode='HTML')
-    else:
-        await update.message.reply_text("⚠️ Group not found in allowed list.", parse_mode='HTML')
-
-async def listgroup_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    groups = load_allowed_groups()
-    if not groups:
-        await update.message.reply_text("ℹ️ No allowed groups.", parse_mode='HTML')
-        return
-    lines = ["📋 <b>Allowed Groups</b>:\n"]
-    for gid, cfg in groups.items():
-        lines.append(f"• <code>{gid}</code> — Free: {cfg['free_limit']}, VIP: {cfg['vip_limit']}")
-    await update.message.reply_text("\n".join(lines), parse_mode='HTML')
-
-# ===== OTHER OWNER COMMANDS =====
-async def startverify_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    settings = load_settings()
-    settings["verification_enabled"] = True
-    save_settings(settings)
-    await update.message.reply_text("✅ Verification requirement has been <b>ENABLED</b>. Free users must verify before sending likes.", parse_mode='HTML')
-
-async def stopverify_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    settings = load_settings()
-    settings["verification_enabled"] = False
-    save_settings(settings)
-    await update.message.reply_text("✅ Verification requirement has been <b>DISABLED</b>. Free users can send likes directly (subject to daily limits).", parse_mode='HTML')
-
-async def add_vip_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    if not context.args or len(context.args) < 3:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/add user_id days like_limit</code>", parse_mode='HTML')
-        return
-    try:
-        user_id = int(context.args[0])
-        days = int(context.args[1])
-        like_limit = int(context.args[2])
-        save_vip_user(user_id, days, like_limit)
-        await update.message.reply_text(f"✅ <b>User {user_id} added to VIP for {days} days with {like_limit} likes per day.</b>", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ <b>Invalid user ID, days or like limit.</b>", parse_mode='HTML')
-
-async def remove_vip_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    if not context.args:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/remove user_id</code>", parse_mode='HTML')
-        return
-    try:
-        user_id = int(context.args[0])
-        remove_vip_user(user_id)
-        await update.message.reply_text(f"✅ <b>User {user_id} removed from VIP.</b>", parse_mode='HTML')
-    except ValueError:
-        await update.message.reply_text("❌ <b>Invalid user ID.</b>", parse_mode='HTML')
-
-async def vip_list_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    vip_users = load_vip_users()
-    if not vip_users:
-        await update.message.reply_text("ℹ️ <b>No VIP users found.</b>", parse_mode='HTML')
-        return
-    text = "🌟 <b>VIP Users List:</b>\n\n"
-    for user in vip_users:
-        text += f"• <b>ID:</b> <code>{user['id']}</code> - <b>Expiry:</b> <code>{user['expiry']}</code> - <b>Limit:</b> <code>{user.get('like_limit', 999)}</code> likes/day\n"
-    await update.message.reply_text(text, parse_mode='HTML')
-
-async def reset_daily_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-    reset_daily_data()
-    await update.message.reply_text("✅ <b>Daily data has been reset.</b>", parse_mode='HTML')
-
-def reset_daily_data():
-    for file in [VERIFIED_FILE, SHORT_LINK_FILE, USAGE_FILE, TOKEN_FILE]:
-        if os.path.exists(file):
-            with open(file, 'w') as f:
-                json.dump([], f)
-    print(f"[{datetime.now(BD_TZ)}] ✅ Daily data reset completed!")
-
-async def addchannel_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/addchannel [name] [link]</code>\nExample: <code>/addchannel @MyChannel https://t.me/MyChannel</code>", parse_mode='HTML')
-        return
-    name = context.args[0]
-    link = context.args[1]
-    add_channel(name, link)
-    await update.message.reply_text(f"✅ Channel <b>{name}</b> added successfully.", parse_mode='HTML')
-
-async def removechannel_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    if not context.args:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/removechannel [name]</code>", parse_mode='HTML')
-        return
-    name = context.args[0]
-    remove_channel(name)
-    await update.message.reply_text(f"✅ Channel <b>{name}</b> removed successfully.", parse_mode='HTML')
-
-async def listchannels_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    channels = get_channels()
-    if not channels:
-        await update.message.reply_text("ℹ️ No channels added yet.", parse_mode='HTML')
-        return
-    text = "📢 <b>Required Channels:</b>\n\n"
-    for ch in channels:
-        text += f"• <b>{ch['name']}</b> - {ch['link']}\n"
-    await update.message.reply_text(text, parse_mode='HTML')
-
-async def startchannelverify_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    settings = load_settings()
-    settings["channel_verification_enabled"] = True
-    save_settings(settings)
-    await update.message.reply_text("✅ Channel subscription verification has been <b>ENABLED</b>. Users must join all required channels.", parse_mode='HTML')
-
-async def stopchannelverify_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    settings = load_settings()
-    settings["channel_verification_enabled"] = False
-    save_settings(settings)
-    await update.message.reply_text("✅ Channel subscription verification has been <b>DISABLED</b>. Users can use the bot without joining channels.", parse_mode='HTML')
-
-async def admin_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ Only owners can use this command.", parse_mode='HTML')
-        return
-    help_text = """
-<b>👑 ADMIN COMMANDS</b>
-
-<b>Bot Control:</b>
-/off &lt;reason&gt; &lt;time&gt;  – Turn off bot with reason and duration (e.g., /off Maintenance 2h)
-/on                   – Turn bot back on
-
-<b>Group Management:</b>
-/addgroup &lt;group_id&gt; &lt;free_limit&gt; &lt;vip_limit&gt;  – Add a group with custom limits
-/removegroup &lt;group_id&gt;                         – Remove a group
-/listgroup                                        – List all allowed groups with limits
-/id                                               – Show current chat ID and your user ID
-
-<b>Channel Management:</b>
-/addchannel [name] [link]  – Add a required channel
-/removechannel [name]      – Remove a channel
-/listchannels              – List all required channels
-/startchannelverify        – Enable subscription check
-/stopchannelverify         – Disable subscription check
-
-<b>Verification Link (like request):</b>
-/startverify               – Enable verification link requirement for free users
-/stopverify                – Disable verification link requirement
-
-<b>VIP Management:</b>
-/add [user_id] [days] [limit]  – Add VIP user
-/remove [user_id]              – Remove VIP user
-/viplist                       – List VIP users
-
-<b>Auto-Like Scheduler:</b>
-/set_autolike &lt;region&gt; &lt;uid&gt; &lt;days&gt; [customer_name]  – Schedule auto-like daily at 04:00 IST
-/remove_autolike &lt;region&gt; &lt;uid&gt;      – Remove a schedule
-/list_autolike                        – List all active schedules
-/test_autolike &lt;region&gt; &lt;uid&gt;        – Test auto-like immediately
-/autolike_logs                        – View last 30 auto-like logs
-
-<b>Token Management:</b>
-/refreshtoken  – Refresh all tokens (BD + IND)
-/refreshbd     – Refresh BD tokens only
-/refreshind    – Refresh IND tokens only
-/tokenstatus   – Token cache status
-/clearcache    – Clear token cache
-/reloadaccounts – Reload accounts from files
-
-<b>Other:</b>
-/resetdaily               – Reset daily limits manually
-/broadcast [message]      – Send announcement to all users and allowed groups
-/stats                    – View your own stats (public)
-"""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Copy All Commands", callback_data="copy_admin")]
-    ])
-    await update.message.reply_text(help_text.strip(), parse_mode='HTML', reply_markup=keyboard)
-
-async def copy_admin_callback(update, context):
-    query = update.callback_query
-    await query.answer()
-    text = """
-👑 ADMIN COMMANDS
-
-/off <reason> <time>
-/on
-
-/addgroup <group_id> <free_limit> <vip_limit>
-/removegroup <group_id>
-/listgroup
-/id
-
-/addchannel [name] [link]
-/removechannel [name]
-/listchannels
-/startchannelverify
-/stopchannelverify
-
-/startverify
-/stopverify
-
-/add [user_id] [days] [limit]
-/remove [user_id]
-/viplist
-
-/set_autolike <region> <uid> <days> [customer_name]
-/remove_autolike <region> <uid>
-/list_autolike
-/test_autolike <region> <uid>
-/autolike_logs
-
-/refreshtoken
-/refreshbd
-/refreshind
-/tokenstatus
-/clearcache
-/reloadaccounts
-
-/resetdaily
-/broadcast [message]
-/stats
-"""
-    await query.edit_message_text(f"<code>{text}</code>", parse_mode='HTML')
-
-# ===== BROADCAST =====
-async def broadcast_command(update, context):
-    if update.message is None:
-        return
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("❌ <b>Only owners can use this command.</b>", parse_mode='HTML')
-        return
-
-    if not context.args:
-        await update.message.reply_text("❌ <b>Usage:</b> <code>/broadcast Your message here</code>", parse_mode='HTML')
-        return
-
-    message = " ".join(context.args)
-    broadcast_text = (
-        f"📢 <b>ANNOUNCEMENT FROM ADMIN</b>\n"
-        f"────────────────────\n"
-        f"{message}\n"
-        f"────────────────────\n"
-        f"<b>Bot Owner:</b> @Mohamed_Rihan1"
-    )
-
-    all_users = set()
-    for user in load_verified_users():
-        all_users.add(user["id"])
-    for user in load_daily_usage():
-        all_users.add(user["id"])
-    for user in load_vip_users():
-        all_users.add(user["id"])
-
-    allowed_groups = load_allowed_groups()
-    group_ids = list(allowed_groups.keys())
-
-    sent_users = 0
-    sent_groups = 0
-    failed_users = 0
-    failed_groups = 0
-
-    status_msg = await update.message.reply_text(
-        f"📤 <b>Broadcasting to {len(all_users)} users and {len(group_ids)} groups...</b>",
-        parse_mode='HTML'
-    )
-
-    for user_id in all_users:
-        try:
-            await context.bot.send_message(chat_id=user_id, text=broadcast_text.strip(), parse_mode='HTML')
-            sent_users += 1
-        except:
-            failed_users += 1
-        if (sent_users + failed_users) % 10 == 0:
-            await status_msg.edit_text(
-                f"📤 <b>Broadcasting...</b>\n\n"
-                f"👤 Users: {sent_users} sent, {failed_users} failed\n"
-                f"👥 Groups: {sent_groups} sent, {failed_groups} failed",
-                parse_mode='HTML'
-            )
-
-    for gid in group_ids:
-        try:
-            await context.bot.send_message(chat_id=int(gid), text=broadcast_text.strip(), parse_mode='HTML')
-            sent_groups += 1
-        except:
-            failed_groups += 1
-        if (sent_groups + failed_groups) % 5 == 0:
-            await status_msg.edit_text(
-                f"📤 <b>Broadcasting...</b>\n\n"
-                f"👤 Users: {sent_users} sent, {failed_users} failed\n"
-                f"👥 Groups: {sent_groups} sent, {failed_groups} failed",
-                parse_mode='HTML'
-            )
-
-    await status_msg.edit_text(
-        f"✅ <b>Broadcast Completed!</b>\n\n"
-        f"👤 <b>Users:</b> {sent_users} success, {failed_users} failed\n"
-        f"👥 <b>Groups:</b> {sent_groups} success, {failed_groups} failed\n\n"
-        f"📅 <b>Completed at:</b> {datetime.now(BD_TZ).strftime('%Y-%m-%d %H:%M:%S')}",
-        parse_mode='HTML'
-    )
-
-# ===== STATS =====
-async def stats_command(update, context):
-    if update.message is None:
-        return
-    if not await check_group_access(update, context):
-        return
-    if not await check_bot_off_and_notify(update, context):
-        return
-    user_id = update.effective_user.id
-    if not is_owner(user_id):
-        if not await check_subscription_and_notify(update, context):
-            return
-
-    used = get_today_usage_count(user_id)
-    group_id = update.effective_chat.id if update.effective_chat.type in ["group", "supergroup"] else None
-    remaining, limit = get_user_remaining(user_id, group_id)
-
-    if is_owner(user_id):
-        vip_status = "👑 Owner"
-        remaining_text = "∞"
-        limit_text = "∞"
-    elif is_vip_user(user_id):
-        vip_status = "💎 VIP"
-        remaining_text = str(remaining) if remaining is not None else "0"
-        limit_text = str(limit) if limit is not None else "0"
-    else:
-        vip_status = "🆓 Free"
-        remaining_text = str(remaining) if remaining is not None else "0"
-        limit_text = str(limit) if limit is not None else "0"
-
-    now = datetime.now(BD_TZ)
-    reset_time = now.replace(hour=4, minute=0, second=0, microsecond=0)
-    if now >= reset_time:
-        reset_time += timedelta(days=1)
-    time_until_reset = reset_time - now
-    hours = time_until_reset.seconds // 3600
-    minutes = (time_until_reset.seconds % 3600) // 60
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 BUY VIP", url=BUY_VIP_LINK)],
-        [InlineKeyboardButton("🌟 JOIN CHANNEL", url=CHANNEL_LINK)]
-    ])
-
-    stats_text = f"📊 <b>YOUR STATISTICS</b>\n────────────────────\n{vip_status}\n🎁 <b>Likes Used Today:</b> <code>{used}/{limit_text}</code>\n🔄 <b>Remaining Today:</b> <code>{remaining_text}</code>\n⏰ <b>Next Reset In:</b> {hours}h {minutes}m\n🕐 <b>Daily Reset:</b> 04:00 AM BST\n\n💎 <b>VIP FEATURES:</b>\n• Unlimited daily likes\n• No verification required\n• Priority processing\n• No ads\n\n📞 <b>Contact @Mohamed_Rihan1 for VIP</b>"
-    await update.message.reply_text(stats_text.strip(), parse_mode='HTML', reply_markup=keyboard)
-
-# ===== STATS CALLBACK (for button) =====
-async def stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    user_id = query.from_user.id
-    
-    used = get_today_usage_count(user_id)
-    remaining, limit = get_user_remaining(user_id, None)
-    
-    if is_owner(user_id):
-        status = "👑 Owner"
-        rem_text = "∞"
-        lim_text = "∞"
-    elif is_vip_user(user_id):
-        status = "💎 VIP"
-        rem_text = str(remaining if remaining is not None else 0)
-        lim_text = str(limit if limit is not None else 0)
-    else:
-        status = "🆓 Free"
-        rem_text = str(remaining if remaining is not None else 0)
-        lim_text = str(limit if limit is not None else 0)
-    
-    now = datetime.now(BD_TZ)
-    reset_time = now.replace(hour=4, minute=0, second=0, microsecond=0)
-    if now >= reset_time:
-        reset_time += timedelta(days=1)
-    time_until_reset = reset_time - now
-    hours = time_until_reset.seconds // 3600
-    minutes = (time_until_reset.seconds % 3600) // 60
-
-    stats_text = (
-        f"📊 <b>YOUR STATISTICS</b>\n"
-        f"────────────────────\n"
-        f"{status}\n"
-        f"🎁 <b>Likes Used Today:</b> <code>{used}/{lim_text}</code>\n"
-        f"🔄 <b>Remaining Today:</b> <code>{rem_text}</code>\n"
-        f"⏰ <b>Next Reset In:</b> {hours}h {minutes}m\n"
-        f"🕐 <b>Daily Reset:</b> 04:00 AM BST\n\n"
-        f"💎 <b>VIP FEATURES:</b>\n"
-        f"• Unlimited daily likes\n"
-        f"• No verification required\n"
-        f"• Priority processing\n"
-        f"• No ads\n\n"
-        f"📞 <b>Contact @Mohamed_Rihan1 for VIP</b>"
-    )
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 BUY VIP", url=BUY_VIP_LINK)],
-        [InlineKeyboardButton("🌟 JOIN CHANNEL", url=CHANNEL_LINK)]
-    ])
-    
-    await query.edit_message_text(stats_text, reply_markup=keyboard, parse_mode='HTML')
-
-# ===== LIKE COMMAND =====
-async def like_command(update, context):
-    if update.message is None:
-        return
-
-    if not await check_group_access(update, context):
-        return
-
-    if not await check_bot_off_and_notify(update, context):
-        return
-
-    user_id = update.effective_user.id
-    if not is_owner(user_id):
-        if not await check_subscription_and_notify(update, context):
-            return
-
-    loading_msg = await update.message.reply_text("🎮 <b>Processing your like request...</b>\n\n⏳ <i>Please wait</i>", parse_mode='HTML')
-    if not context.args or len(context.args) < 2:
-        await loading_msg.edit_text("❌ <b>Invalid Format</b>\n\n📝 <b>Usage:</b> <code>/like [region] [uid]</code>\n\n🌍 <b>Valid regions:</b> ind, bd, sg, id, me, br, vn, eu, th, na, us, uk\n\n📌 <b>Example:</b> <code>/like ind 8431487083</code>", parse_mode='HTML')
-        return
-    region = context.args[0].lower()
-    uid = context.args[1]
-    if region not in VALID_REGIONS:
-        await loading_msg.edit_text(f"❌ <b>Invalid Region</b>\n\n<b>You entered:</b> <code>{region}</code>\n<b>Valid regions:</b> ind, bd, sg, id, me, br, vn, eu, th, na, us, uk\n\n📌 <b>Example:</b> <code>/like ind 8431487083</code>", parse_mode='HTML')
-        return
-
-    group_id = update.effective_chat.id if update.effective_chat.type in ["group", "supergroup"] else None
-
-    if is_owner(user_id):
-        await loading_msg.edit_text("🎮 <b>Sending likes to Free Fire...</b>\n\n⏳ <i>Please wait 10-20 seconds</i>", parse_mode='HTML')
-        api_response = await call_like_api(region, uid)
-        status = api_response.get("status")
-        if status == 0:
-            await loading_msg.edit_text(f"❌ <b>Failed to send likes!</b>\n\n<b>Error:</b> {api_response.get('message', 'Unknown error')}", parse_mode='HTML')
-            return
-        await send_like_success_message(update, context, api_response, region, is_vip=False)
-        await loading_msg.delete()
-        return
-
-    if has_reached_daily_limit(user_id, group_id):
-        used = get_today_usage_count(user_id)
-        if is_vip_user(user_id):
-            _, limit = get_user_remaining(user_id, group_id)
-        else:
-            limit, _ = get_user_remaining(user_id, group_id)
-        if limit is None:
-            limit = "Unlimited"
-        await loading_msg.edit_text(f"🚫 <b>Daily Limit Reached!</b>\n\nYou have used {used}/{limit} likes today.\nPlease try again tomorrow after 4 AM BST.\n\n💎 <b>Want unlimited likes?</b> Buy VIP! @Mohamed_Rihan1", parse_mode='HTML')
-        return
-
-    settings = load_settings()
-    verification_enabled = settings.get("verification_enabled", True)
-
-    if verification_enabled and not is_user_verified_recently(user_id):
-        token = save_verification_token(user_id, uid, region)
-    destination_url = f"{BASE_URL}?uid={uid}&region={region}&key={LIKE_API_KEY}" # Like API er link
-    short_link = destination_url
-    first_name = update.effective_user.first_name
-    text = (
-        f"🎮 <b>LIKE REQUEST VERIFICATION</b>\n"
-        f"👤 Name: {first_name}\n"
-        f"🆔 UID: {uid}\n"
-        f"🌍 Region: {region.upper()}\n\n"
-        f"🔗 Verification Link:\n{short_link}\n\n"
-        f"⚠️ Link expires in 10 minutes\n"
-        f"📞 Any Problem DM: @Mohamed_Rihan1"
-    )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ VERIFY & SEND LIKES", url=short_link)],
-        [InlineKeyboardButton("❓ HOW TO VERIFY?", url=HOW_TO_VERIFY_LINK)],
-        [InlineKeyboardButton("💎 BUY VIP", url=BUY_VIP_LINK)],
-        [InlineKeyboardButton("🌟 JOIN CHANNEL", url=CHANNEL_LINK)]
-    ])
-    await loading_msg.edit_text(text.strip(), reply_markup=keyboard, parse_mode='HTML')
-    return
-
-    await loading_msg.edit_text("🎮 <b>Sending likes to Free Fire...</b>\n\n⏳ <i>Please wait 10-20 seconds</i>", parse_mode='HTML')
-    api_response = await call_like_api(region, uid)
-    status = api_response.get("status")
-    
-    if status == 0:
-        await loading_msg.edit_text(f"❌ <b>Failed to send likes!</b>\n\n<b>Error:</b> {api_response.get('message', 'Unknown error')}\n\n⚠️ Please try again after some time.", parse_mode='HTML')
-        return
-
-    if status == 1:
-        save_daily_usage(user_id)
-    
-    await send_like_success_message(update, context, api_response, region, is_vip=is_vip_user(user_id))
-    await loading_msg.delete()
-
-# ===== SEND LIKE SUCCESS MESSAGE =====
-async def send_like_success_message(update, context, api_response, region, is_vip=False):
-    user = update.effective_user
-    user_name = user.full_name or user.first_name or "User"
-    user_id = user.id
-    group_id = update.effective_chat.id if update.effective_chat.type in ["group", "supergroup"] else None
-
-    if is_owner(user_id):
-        user_type = "👑 Owner"
-    elif is_vip or is_vip_user(user_id):
-        user_type = "💎 VIP"
-    else:
-        user_type = "🆓 Free"
-
-    remaining, limit = get_user_remaining(user_id, group_id)
-    if is_owner(user_id):
-        remaining_text = "∞"
-    else:
-        remaining_text = str(remaining) if remaining is not None else "0"
-
-    status = api_response.get("status")
-
-    if status == 2:
-        text = (
-            f"🎮 <b>FREE FIRE LIKE STATUS</b>\n"
-            f"────────────────────\n"
-            f"🎯 <b>Player:</b> <code>{api_response.get('PlayerNickname', 'N/A')}</code>\n"
-            f"🆔 <b>UID:</b> <code>{api_response.get('UID', 'N/A')}</code>\n"
-            f"🌍 <b>Region:</b> <code>{region.upper()}</code>\n\n"
-            f"📊 <b>CURRENT LIKES:</b> <code>{api_response.get('LikesafterCommand', 0)}</code>\n"
-            f"🎉 <b>Status:</b> Maximum likes reached!\n"
-            f"📝 <b>Note:</b> Bot Don't Consume Your Limit ✅\n\n"
-            f"👤 <b>Type:</b> {user_type}\n"
-            f"👤 <b>User:</b> {user_name}\n"
-            f"📅 <b>Next Reset:</b> 04:00 AM BST\n"
-            f"🔄 <b>Remaining Today:</b> <code>{remaining_text}</code>\n"
-            f"────────────────────\n"
-            f"<b>Owner:</b> @Mohamed_Rihan1"
-        )
-
-    elif status == 1:
-        text = (
-            f"🎮 <b>FREE FIRE LIKE SUCCESS</b>\n"
-            f"────────────────────\n"
-            f"🎯 <b>Player:</b> <code>{api_response.get('PlayerNickname', 'N/A')}</code>\n"
-            f"🆔 <b>UID:</b> <code>{api_response.get('UID', 'N/A')}</code>\n"
-            f"🌍 <b>Region:</b> <code>{region.upper()}</code>\n\n"
-            f"📊 <b>BEFORE:</b> <code>{api_response.get('LikesbeforeCommand', 0)}</code>\n"
-            f"📈 <b>AFTER:</b> <code>{api_response.get('LikesafterCommand', 0)}</code>\n"
-            f"🎁 <b>SENT:</b> <code>{api_response.get('LikesGivenByAPI', 0)}</code> likes\n\n"
-            f"👤 <b>Type:</b> {user_type}\n"
-            f"👤 <b>User:</b> {user_name}\n"
-            f"📅 <b>Next Reset:</b> 04:00 AM BST\n"
-            f"🔄 <b>Remaining Today:</b> <code>{remaining_text}</code>\n"
-            f"────────────────────\n"
-            f"<b>Owner:</b> @Mohamed_Rihan1"
-        )
-
-    else:
-        error_msg = api_response.get('message', 'Unknown error')
-        text = (
-            f"❌ <b>LIKE SENDING FAILED</b>\n"
-            f"────────────────────\n"
-            f"🎯 <b>Player:</b> <code>{api_response.get('PlayerNickname', 'N/A')}</code>\n"
-            f"🆔 <b>UID:</b> <code>{api_response.get('UID', 'N/A')}</code>\n"
-            f"🌍 <b>Region:</b> <code>{region.upper()}</code>\n\n"
-            f"⚠️ <b>Error:</b> {error_msg}\n\n"
-            f"👤 <b>Type:</b> {user_type}\n"
-            f"👤 <b>User:</b> {user_name}\n"
-            f"📅 <b>Next Reset:</b> 04:00 AM BST\n"
-            f"🔄 <b>Remaining Today:</b> <code>{remaining_text}</code>\n"
-            f"────────────────────\n"
-            f"<b>Owner:</b> @Mohamed_Rihan1"
-        )
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 BUY VIP", url=BUY_VIP_LINK)],
-        [InlineKeyboardButton("🌟 JOIN CHANNEL", url=CHANNEL_LINK)],
-        [InlineKeyboardButton("📊 CHECK STATS", callback_data="stats")]
-    ])
-
-    await update.message.reply_text(text.strip(), reply_markup=keyboard, parse_mode='HTML')
-
-# ===== START COMMAND =====
-async def start_command(update, context):
-    if update.message is None:
-        return
-    if not await check_group_access(update, context):
-        return
-    if not await check_bot_off_and_notify(update, context):
-        return
-
-    user_id = update.effective_user.id
-    args = context.args
-    if not is_owner(user_id):
-        if not await check_subscription_and_notify(update, context):
-            return
-
-    if args and args[0].startswith("verified_"):
-        token = args[0][9:]
-        token_data = get_token_data(token)
-        if not token_data:
-            await update.message.reply_text("❌ <b>Invalid or expired verification link!</b>\n\n⚠️ Link expires in 10 minutes.\nPlease generate a new link using: <code>/like [region] [uid]</code>", parse_mode='HTML')
-            return
-        if token_data["user_id"] != user_id:
-            await update.message.reply_text("❌ <b>This verification link is not for you!</b>\n\nPlease generate your own link using: <code>/like [region] [uid]</code>", parse_mode='HTML')
-            return
-        region = token_data["region"]
-        uid = token_data["uid"]
-        group_id = update.effective_chat.id if update.effective_chat.type in ["group", "supergroup"] else None
-        if not is_vip_user(user_id) and has_reached_daily_limit(user_id, group_id):
-            used = get_today_usage_count(user_id)
-            await update.message.reply_text(f"🚫 <b>Daily Limit Reached!</b>\n\nYou have used {used} likes today.\nPlease try again tomorrow after 4 AM BST.\n\n💎 <b>Want unlimited likes?</b> Buy VIP! @Mohamed_Rihan1", parse_mode='HTML')
-            return
-        await update.message.reply_text("✅ <b>Verification complete!</b>\n\n⏳ <b>Processing like request...</b>", parse_mode='HTML')
-        loading_msg = await update.message.reply_text("🎮 <b>Sending likes to Free Fire...</b>\n\n⏳ <i>Please wait 10-20 seconds</i>", parse_mode='HTML')
-        save_verified_user(user_id, uid, region)
-        api_response = await call_like_api(region, uid)
-        status = api_response.get("status")
-        if status == 0:
-            await loading_msg.edit_text(f"❌ <b>Failed to send likes!</b>\n\n<b>Error:</b> {api_response.get('message', 'Unknown error')}\n\n⚠️ Please try again after some time.", parse_mode='HTML')
-            return
-        if status == 1:
-            save_daily_usage(user_id)
-        await send_like_success_message(update, context, api_response, region, is_vip=is_vip_user(user_id))
-        await loading_msg.delete()
-        return
-
-    used = get_today_usage_count(user_id)
-    group_id = update.effective_chat.id if update.effective_chat.type in ["group", "supergroup"] else None
-    remaining, limit = get_user_remaining(user_id, group_id)
-    if is_owner(user_id):
-        vip_status = "👑 Owner"
-        remaining_text = "∞"
-    elif is_vip_user(user_id):
-        vip_status = "💎 VIP"
-        remaining_text = str(remaining) if remaining is not None else "0"
-    else:
-        vip_status = "🆓 Free"
-        remaining_text = str(remaining) if remaining is not None else "0"
-
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💎 BUY VIP", url=BUY_VIP_LINK)],
-        [InlineKeyboardButton("🌟 JOIN CHANNEL", url=CHANNEL_LINK)]
-    ])
-
-    welcome_text = f"🎮 <b>WELCOME TO FREE FIRE VIP LIKES BOT</b>\n────────────────────\n{vip_status}\n📊 <b>Likes Used Today:</b> <code>{used}</code>\n🔄 <b>Remaining Today:</b> <code>{remaining_text}</code>\n🕐 <b>Daily Reset:</b> 04:00 AM BST\n\n<b>COMMANDS:</b>\n🎁 <code>/like [region] [uid]</code> - Send likes\n📊 <code>/stats</code> - Check your stats\n\n<b>EXAMPLE:</b>\n<code>/like ind 8431487083</code>\n\n<b>VALID REGIONS:</b>\n🇮🇳 ind, 🇧🇩 bd, 🇸🇬 sg, 🇮🇩 id, 🇲🇪 me\n🇧🇷 br, 🇻🇳 vn, 🇪🇺 eu, 🇹🇭 th, 🇺🇸 us, 🇬🇧 uk\n\n💎 <b>Buy VIP for unlimited likes!</b>"
-    await update.message.reply_text(welcome_text.strip(), parse_mode='HTML', reply_markup=keyboard)
-
-# ===== CALLBACK HANDLER =====
-async def check_subscription_callback(update, context):
-    query = update.callback_query
-    user_id = query.from_user.id
-    await query.answer()
-    if await is_user_subscribed(context.bot, user_id):
-        await query.edit_message_text("✅ <b>Subscription Verified!</b>\n\nThank you for joining all channels! 🎉\n\nYou can now use the bot features:\n• Use <code>/like [region] [uid]</code> to send likes\n• Check <code>/stats</code> for your usage\n• Consider <code>/vip</code> for unlimited access\n\n<b>Happy Gaming! 🎮</b>", parse_mode='HTML')
-    else:
-        channels = get_channels()
-        keyboard_buttons = []
-        for ch in channels:
-            keyboard_buttons.append([InlineKeyboardButton(f"📢 JOIN {ch['name']}", url=ch['link'])])
-        keyboard_buttons.append([InlineKeyboardButton("✅ I'VE JOINED", callback_data="check_subscription")])
-        keyboard = InlineKeyboardMarkup(keyboard_buttons)
-        await query.edit_message_text("❌ <b>Not Subscribed Yet</b>\n\nI still don't see you in all channels! 😔\n\nPlease make sure to:\n1. Click each JOIN button\n2. Actually join each channel\n3. Then click I'VE JOINED\n\nIf you've already joined, wait a moment and try again.", reply_markup=keyboard, parse_mode='HTML')
-
-# ===== CLEANUP =====
-async def cleanup_expired_tokens():
-    tokens = load_json(TOKEN_FILE)
-    current_time = datetime.now()
-    valid_tokens = []
-    expired_count = 0
-    for token in tokens:
-        expiry = datetime.fromisoformat(token["expiry"])
-        if current_time <= expiry and not token["used"]:
-            valid_tokens.append(token)
-        else:
-            expired_count += 1
-    if expired_count > 0:
-        print(f"[{datetime.now(BD_TZ)}] 🗑️ Cleared {expired_count} expired tokens")
-    save_json(TOKEN_FILE, valid_tokens)
-
-async def scheduled_daily_reset():
-    reset_daily_data()
-    try:
-        global bot_app
-        if bot_app:
-            for owner_id in OWNER_IDS:
-                try:
-                    await bot_app.bot.send_message(chat_id=owner_id, text=f"✅ <b>Daily Reset Completed!</b>\n\n🕐 Time: {datetime.now(BD_TZ).strftime('%Y-%m-%d %H:%M:%S')}\n📊 All user limits have been reset.\n🔄 Ready for new day!", parse_mode='HTML')
-                except:
-                    pass
-    except:
-        pass
-
-def initialize_files():
-    files = [VERIFIED_FILE, SHORT_LINK_FILE, USAGE_FILE, VIP_FILE, TOKEN_FILE, SETTINGS_FILE, CHANNELS_FILE, AUTOLIKE_SCHEDULES_FILE, AUTOLIKE_LOGS_FILE, ALLOWED_GROUPS_FILE, TOKEN_CACHE_FILE, TOKEN_CACHE_IND_FILE, BOT_STATE_FILE]
-    for file in files:
-        if not os.path.exists(file):
-            with open(file, 'w') as f:
-                if file == SETTINGS_FILE:
-                    json.dump({"verification_enabled": True, "channel_verification_enabled": True}, f)
-                elif file in [CHANNELS_FILE, ALLOWED_GROUPS_FILE, AUTOLIKE_SCHEDULES_FILE, TOKEN_CACHE_FILE, TOKEN_CACHE_IND_FILE, BOT_STATE_FILE]:
-                    json.dump({} if file != BOT_STATE_FILE else {"off": False, "reason": "", "expiry": 0}, f)
-                else:
-                    json.dump([], f)
-            print(f"[{datetime.now(BD_TZ)}] Created {file}")
-
-def clear_verified_data():
-    for file in [VERIFIED_FILE, SHORT_LINK_FILE, USAGE_FILE, VIP_FILE, TOKEN_FILE]:
-        if os.path.exists(file):
-            with open(file, 'w') as f:
-                json.dump([], f)
-    print(f"[{datetime.now(BD_TZ)}] 🧹 Data cleared.")
-
-def handle_shutdown(signum, frame):
-    print(f"[{datetime.now(BD_TZ)}] 🚫 Bot stopping...")
-    clear_verified_data()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, handle_shutdown)
-signal.signal(signal.SIGTERM, handle_shutdown)
-
-# ===== MAIN =====
-async def main():
-    global bot_app
-    initialize_files()
-    load_token_cache("BD")
-    load_token_cache("IND")
-    
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    bot_app = app
-    app.bot_data['app'] = app
-    
-    # ===== শুরুতে টোকেন রিফ্রেশ (সরানো হয়েছে - Memory crash ঠিক করতে) =====
-    # asyncio.create_task(refresh_all_tokens_on_start(app))   # <-- এই লাইনটি ডিলিট/কমেন্ট করা হয়েছে
-    
-    # ===== কমান্ড হ্যান্ডলার =====
-    app.add_handler(CommandHandler("like", like_command))
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("id", id_command))
-    app.add_handler(CommandHandler("add", add_vip_command))
-    app.add_handler(CommandHandler("remove", remove_vip_command))
-    app.add_handler(CommandHandler("viplist", vip_list_command))
-    app.add_handler(CommandHandler("resetdaily", reset_daily_command))
-    app.add_handler(CommandHandler("broadcast", broadcast_command))
-    app.add_handler(CommandHandler("startverify", startverify_command))
-    app.add_handler(CommandHandler("stopverify", stopverify_command))
-    app.add_handler(CommandHandler("addchannel", addchannel_command))
-    app.add_handler(CommandHandler("removechannel", removechannel_command))
-    app.add_handler(CommandHandler("listchannels", listchannels_command))
-    app.add_handler(CommandHandler("startchannelverify", startchannelverify_command))
-    app.add_handler(CommandHandler("stopchannelverify", stopchannelverify_command))
-    app.add_handler(CommandHandler("addgroup", addgroup_command))
-    app.add_handler(CommandHandler("removegroup", removegroup_command))
-    app.add_handler(CommandHandler("listgroup", listgroup_command))
-    app.add_handler(CommandHandler("set_autolike", set_autolike_command))
-    app.add_handler(CommandHandler("remove_autolike", remove_autolike_command))
-    app.add_handler(CommandHandler("list_autolike", list_autolike_command))
-    app.add_handler(CommandHandler("test_autolike", test_autolike_command))
-    app.add_handler(CommandHandler("autolike_logs", autolike_logs_command))
-    app.add_handler(CommandHandler("admin", admin_command))
-    
-    # নতুন কমান্ড
-    app.add_handler(CommandHandler("off", off_command))
-    app.add_handler(CommandHandler("on", on_command))
-    
-    # টোকেন কমান্ড
-    app.add_handler(CommandHandler("refreshtoken", refreshtoken_command))
-    app.add_handler(CommandHandler("refreshbd", refreshbd_command))
-    app.add_handler(CommandHandler("refreshind", refreshind_command))
-    app.add_handler(CommandHandler("tokenstatus", tokenstatus_command))
-    app.add_handler(CommandHandler("clearcache", clearcache_command))
-    app.add_handler(CommandHandler("reloadaccounts", reloadaccounts_command))
-    
-    # কলব্যাক হ্যান্ডলার
-    app.add_handler(CallbackQueryHandler(check_subscription_callback, pattern="^check_subscription$"))
-    app.add_handler(CallbackQueryHandler(copy_admin_callback, pattern="^copy_admin$"))
-    app.add_handler(CallbackQueryHandler(stats_callback, pattern="^stats$"))
-    
-    await cleanup_expired_tokens()
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(scheduled_daily_reset, CronTrigger(hour=4, minute=0, timezone='Asia/Dhaka'))
-    scheduler.add_job(cleanup_expired_tokens, 'interval', minutes=30)
-    scheduler.add_job(process_autolike, CronTrigger(hour=4, minute=0, timezone='Asia/Dhaka'))
-    scheduler.start()
-    
-    # অটো টোকেন রিফ্রেশ (প্রতি ৭ ঘন্টা)
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(lambda ctx: refresh_all_tokens(ctx, "BD"), interval=TOKEN_REFRESH_INTERVAL, first=10)
-        job_queue.run_repeating(lambda ctx: refresh_all_tokens(ctx, "IND"), interval=TOKEN_REFRESH_INTERVAL, first=20)
-        print("✅ Auto refresh scheduled every 7 hours for both BD and IND")
-    else:
-        print("⚠️ JobQueue not available")
-    
-    print(f"[{datetime.now(BD_TZ)}] 🤖 Free Fire VIP Likes Bot is running...")
-    print(f"[{datetime.now(BD_TZ)}] 📢 Official Group: {OFFICIAL_GROUP_LINK}")
-    print(f"[{datetime.now(BD_TZ)}] ⏰ Daily reset & auto-like scheduled at: 04:00 AM BST")
-    print(f"[{datetime.now(BD_TZ)}] 🔒 Verification toggle: {load_settings().get('verification_enabled', True)}")
-    print(f"[{datetime.now(BD_TZ)}] 📢 Channel verification: {load_settings().get('channel_verification_enabled', True)}")
-    print(f"[{datetime.now(BD_TZ)}] 📋 Allowed groups: {len(load_allowed_groups())}")
-    print(f"[{datetime.now(BD_TZ)}] 👑 Owners: {OWNER_IDS}")
-    
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Bot stopped manually.")
+            with open("token_bd.json", "r") as f:
+                tokens = json.load(f)
+        return tokens
     except Exception as e:
-        print(f"❌ FATAL CRASH: {e}")
-        import traceback
-        traceback.print_exc()
+        app.logger.error(f"Error loading tokens for region {region}: {e}")
+        return None
+
+
+def encrypt_message(plaintext):
+    try:
+        key = b'Yg&tc%DEuh6%Zc^8'
+        iv = b'6oyZDr22E3ychjM%'
+        cipher = AES.new(key, AES.MODE_CBC, iv)
+        padded_message = pad(plaintext, AES.block_size)
+        encrypted_message = cipher.encrypt(padded_message)
+        return binascii.hexlify(encrypted_message).decode('utf-8')
+    except Exception as e:
+        app.logger.error(f"Error encrypting message: {e}")
+        return None
+
+
+def create_protobuf_message(user_id, region):
+    try:
+        message = like_pb2.like()
+        message.uid = int(user_id)
+        message.region = region
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating protobuf message: {e}")
+        return None
+
+
+async def send_request(encrypted_uid, token, url):
+    try:
+        edata = bytes.fromhex(encrypted_uid)
+        headers = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Expect": "100-continue",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB55"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=edata, headers=headers) as response:
+                return await response.text()
+    except Exception as e:
+        app.logger.error(f"Exception in send_request: {e}")
+        return None
+
+
+async def send_multiple_requests(uid, region, url):
+    try:
+        protobuf_message = create_protobuf_message(uid, region)
+        if protobuf_message is None:
+            return None
+        encrypted_uid = encrypt_message(protobuf_message)
+        if encrypted_uid is None:
+            return None
+        tokens = load_tokens(region)
+        if tokens is None:
+            return None
+        tasks = []
+        for i in range(100):
+            token = tokens[i % len(tokens)]["token"]
+            tasks.append(send_request(encrypted_uid, token, url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return results
+    except Exception as e:
+        app.logger.error(f"Exception in send_multiple_requests: {e}")
+        return None
+
+
+def create_protobuf(uid):
+    try:
+        message = uid_generator_pb2.uid_generator()
+        message.saturn_ = int(uid)
+        message.garena = 1
+        return message.SerializeToString()
+    except Exception as e:
+        app.logger.error(f"Error creating uid protobuf: {e}")
+        return None
+
+
+def enc(uid):
+    protobuf_data = create_protobuf(uid)
+    if protobuf_data is None:
+        return None
+    return encrypt_message(protobuf_data)
+
+
+def make_request(encrypt, region, token):
+    try:
+        if region == "IND":
+            url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
+        elif region in {"BR", "US", "SAC", "NA"}:
+            url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
+        else:
+            url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
+        edata = bytes.fromhex(encrypt)
+        headers = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
+            "Connection": "Keep-Alive",
+            "Accept-Encoding": "gzip",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Expect": "100-continue",
+            "X-Unity-Version": "2018.4.11f1",
+            "X-GA": "v1 1",
+            "ReleaseVersion": "OB55"
+        }
+        response = requests.post(url, data=edata, headers=headers, verify=False)
+        binary = response.content
+        decoded = visit_count_pb2.Info()
+        decoded.ParseFromString(binary)
+        return decoded
+    except DecodeError as e:
+        app.logger.error(f"DecodeError: {e}")
+        return None
+    except Exception as e:
+        app.logger.error(f"Error in make_request: {e}")
+        return None
+
+
+@app.route('/like', methods=['GET'])
+def handle_requests():
+    global used_count  # ✅ fix added
+
+    # ✅ API key check
+    api_key = request.args.get("key")
+    if api_key not in VALID_API_KEYS:
+        result = OrderedDict([
+            ("error", "Invalid or missing API key"),
+            ("status", 3)
+        ])
+        return app.response_class(
+            response=json.dumps(result, separators=(',', ':')),
+            status=401,
+            mimetype='application/json'
+        )
+
+    uid = request.args.get("uid")
+    region = request.args.get("region", "").upper()
+    if not uid or not region:
+        return {"error": "UID and region are required"}, 400
+
+    try:
+        def process_request():
+            global used_count  # ✅ fix added again (for nested function)
+
+            tokens = load_tokens(region)
+            if not tokens:
+                raise Exception("Failed to load tokens.")
+            token = tokens[0]['token']
+            encrypted_uid = enc(uid)
+            if encrypted_uid is None:
+                raise Exception("Encryption of UID failed.")
+            before = make_request(encrypted_uid, region, token)
+            if before is None:
+                raise Exception("Failed to get initial info.")
+            before_like = before.AccountInfo.Likes
+
+            if region == "IND":
+                url = "https://client.ind.freefiremobile.com/LikeProfile"
+            elif region in {"BR", "US", "SAC", "NA"}:
+                url = "https://client.us.freefiremobile.com/LikeProfile"
+            else:
+                url = "https://clientbp.ggpolarbear.com/LikeProfile"
+
+            asyncio.run(send_multiple_requests(uid, region, url))
+
+            after = make_request(encrypted_uid, region, token)
+            if after is None:
+                raise Exception("Failed to get final info.")
+            after_like = after.AccountInfo.Likes
+            like_given = after_like - before_like
+            status = 1 if like_given > 0 else 2
+
+            # ✅ Count only when successful (status == 1)
+            if status == 1:
+                used_count += 1
+
+            remaining = max(daily_limit - used_count, 0)
+
+            result = OrderedDict([
+                ("LikesGivenByAPI", like_given),
+                ("LikesafterCommand", after_like),
+                ("LikesbeforeCommand", before_like),
+                ("PlayerNickname", after.AccountInfo.PlayerNickname),
+                ("Level", after.AccountInfo.Levels),
+                ("Region", after.AccountInfo.PlayerRegion),
+                ("UID", after.AccountInfo.UID),
+                ("status", status),
+                ("daily_limit", daily_limit),
+                ("used", used_count),
+                ("remaining", remaining)
+            ])
+
+            return app.response_class(
+                response=json.dumps(result, separators=(',', ':')),
+                status=200,
+                mimetype='application/json'
+            )
+
+        return process_request()
+
+    except Exception as e:
+        app.logger.error(f"Error: {e}")
+        return {"error": str(e)}, 500
+
+
+# 🆕 /remain endpoint
+@app.route('/remain', methods=['GET'])
+def remain_info():
+    global used_count  # ✅ fix added
+
+    remaining = max(daily_limit - used_count, 0)
+    data = {
+        "daily_limit": daily_limit,
+        "remaining": remaining,
+        "used": used_count,
+        "reset_info": "4:00 AM IST"
+    }
+    return jsonify(data)
+
+
+if __name__ == '__main__':
+    app.run(debug=True, use_reloader=False)
